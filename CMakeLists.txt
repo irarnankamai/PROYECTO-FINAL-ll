@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(
     TaxiDetector
     VERSION 1.0
-    DESCRIPTION "Detector de taxis amarillos con OpenCV, HOG, SVM y API"
+    DESCRIPTION "Detector de taxis amarillos con OpenCV, HOG, SVM, FFmpeg y API"
     LANGUAGES CXX
 )
 
@@ -13,15 +13,34 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED)
 find_package(CURL REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(
+    FFMPEG
+    REQUIRED
+    IMPORTED_TARGET
+    libavcodec
+    libavformat
+    libavutil
+    libswscale
+)
 
 function(configurar_advertencias objetivo)
-    target_compile_options(
-        ${objetivo}
-        PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-    )
+    if(MSVC)
+        target_compile_options(
+            ${objetivo}
+            PRIVATE
+            /W4
+        )
+    else()
+        target_compile_options(
+            ${objetivo}
+            PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+        )
+    endif()
 endfunction()
 
 # ============================================================
@@ -115,6 +134,7 @@ target_link_libraries(
     PRIVATE
     ${OpenCV_LIBS}
     CURL::libcurl
+    PkgConfig::FFMPEG
 )
 
 configurar_advertencias(detectar_taxi_camara)

@@ -6,12 +6,12 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
-#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -39,7 +39,9 @@ std::size_t recibirRespuesta(
         tamano * cantidad;
 
     auto* texto =
-        static_cast<std::string*>(destino);
+        static_cast<std::string*>(
+            destino
+        );
 
     texto->append(
         datos,
@@ -90,6 +92,7 @@ private:
 InicializadorCurl& obtenerCurlGlobal()
 {
     static InicializadorCurl instancia;
+
     return instancia;
 }
 
@@ -100,7 +103,10 @@ std::string quitarEspacios(
     const auto noEsEspacio =
         [](unsigned char caracter)
         {
-            return std::isspace(caracter) == 0;
+            return
+                std::isspace(
+                    caracter
+                ) == 0;
         };
 
     const auto inicio =
@@ -138,12 +144,21 @@ std::string quitarEspaciosJson(
         texto.size()
     );
 
-    for (const unsigned char caracter : texto)
+    for (
+        const unsigned char caracter
+        : texto
+    )
     {
-        if (std::isspace(caracter) == 0)
+        if (
+            std::isspace(
+                caracter
+            ) == 0
+        )
         {
             resultado.push_back(
-                static_cast<char>(caracter)
+                static_cast<char>(
+                    caracter
+                )
             );
         }
     }
@@ -156,11 +171,14 @@ bool jsonConfirmaOperacion(
 )
 {
     const std::string cuerpoCompacto =
-        quitarEspaciosJson(cuerpo);
+        quitarEspaciosJson(
+            cuerpo
+        );
 
     return
-        cuerpoCompacto.find("\"ok\":true")
-        != std::string::npos;
+        cuerpoCompacto.find(
+            "\"ok\":true"
+        ) != std::string::npos;
 }
 
 bool agregarTexto(
@@ -205,16 +223,25 @@ bool agregarTexto(
         ) == CURLE_OK;
 }
 
-bool agregarArchivo(
+/*
+ * Agrega un archivo al formulario multipart directamente
+ * desde un vector de bytes almacenado en memoria RAM.
+ *
+ * No abre ni crea archivos en el sistema.
+ */
+bool agregarArchivoMemoria(
     curl_mime* formulario,
     const char* nombreCampo,
-    const std::filesystem::path& ruta,
+    const std::vector<unsigned char>& datos,
+    const std::string& nombreArchivo,
     const char* tipoMime
 )
 {
     if (
         formulario == nullptr
         || nombreCampo == nullptr
+        || datos.empty()
+        || nombreArchivo.empty()
     )
     {
         return false;
@@ -240,22 +267,30 @@ bool agregarArchivo(
         return false;
     }
 
-    const std::string rutaTexto =
-        ruta.string();
-
+    /*
+     * Se entrega a libcurl la dirección del vector y
+     * su tamaño exacto.
+     *
+     * El tamaño explícito permite enviar datos binarios
+     * que contienen bytes con valor cero.
+     */
     if (
-        curl_mime_filedata(
+        curl_mime_data(
             parte,
-            rutaTexto.c_str()
+            reinterpret_cast<const char*>(
+                datos.data()
+            ),
+            datos.size()
         ) != CURLE_OK
     )
     {
         return false;
     }
 
-    const std::string nombreArchivo =
-        ruta.filename().string();
-
+    /*
+     * Este nombre se incluye en multipart/form-data,
+     * pero no representa una ruta física en el disco.
+     */
     if (
         curl_mime_filename(
             parte,
@@ -296,54 +331,70 @@ bool agregarEncabezado(
         return false;
     }
 
-    encabezados = nuevaLista;
+    encabezados =
+        nuevaLista;
 
     return true;
 }
 
-std::string detectarMimeVideo(
-    const std::filesystem::path& ruta
+std::string convertirMinusculas(
+    std::string texto
 )
 {
-    std::string extension =
-        ruta.extension().string();
-
     std::transform(
-        extension.begin(),
-        extension.end(),
-        extension.begin(),
+        texto.begin(),
+        texto.end(),
+        texto.begin(),
         [](unsigned char caracter)
         {
             return static_cast<char>(
-                std::tolower(caracter)
+                std::tolower(
+                    caracter
+                )
             );
         }
     );
 
+    return texto;
+}
+
+/*
+ * Determina el tipo MIME usando solamente el nombre lógico
+ * enviado en multipart. No inspecciona ningún archivo físico.
+ */
+std::string detectarMimeVideo(
+    const std::string& nombreVideo
+)
+{
+    const std::string nombre =
+        convertirMinusculas(
+            nombreVideo
+        );
+
     if (
-        extension == ".mp4"
-        || extension == ".m4v"
+        nombre.ends_with(".mp4")
+        || nombre.ends_with(".m4v")
     )
     {
         return "video/mp4";
     }
 
-    if (extension == ".avi")
+    if (nombre.ends_with(".avi"))
     {
         return "video/x-msvideo";
     }
 
-    if (extension == ".mov")
+    if (nombre.ends_with(".mov"))
     {
         return "video/quicktime";
     }
 
-    if (extension == ".webm")
+    if (nombre.ends_with(".webm"))
     {
         return "video/webm";
     }
 
-    if (extension == ".mkv")
+    if (nombre.ends_with(".mkv"))
     {
         return "video/x-matroska";
     }
@@ -378,8 +429,22 @@ void obtenerInformacionRespuesta(
     )
     {
         respuesta.latenciaMilisegundos =
-            tiempoTotalSegundos * 1000.0;
+            tiempoTotalSegundos
+            * 1000.0;
     }
+}
+
+double convertirBytesAMegabytes(
+    std::size_t bytes
+)
+{
+    constexpr double BYTES_POR_MEGABYTE =
+        1024.0 * 1024.0;
+
+    return
+        static_cast<double>(
+            bytes
+        ) / BYTES_POR_MEGABYTE;
 }
 }
 
@@ -388,10 +453,14 @@ ClienteAPI::ClienteAPI(
     std::string apiKey
 )
     : urlBase_(
-          limpiarUrl(urlBase)
+          limpiarUrl(
+              urlBase
+          )
       ),
       apiKey_(
-          quitarEspacios(apiKey)
+          quitarEspacios(
+              apiKey
+          )
       )
 {
 }
@@ -436,7 +505,9 @@ std::string ClienteAPI::limpiarUrl(
 )
 {
     std::string resultado =
-        quitarEspacios(url);
+        quitarEspacios(
+            url
+        );
 
     while (
         resultado.size() > 1
@@ -447,56 +518,6 @@ std::string ClienteAPI::limpiarUrl(
     }
 
     return resultado;
-}
-
-bool ClienteAPI::archivoValido(
-    const std::filesystem::path& ruta
-)
-{
-    if (ruta.empty())
-    {
-        return false;
-    }
-
-    std::error_code error;
-
-    const bool existe =
-        std::filesystem::exists(
-            ruta,
-            error
-        );
-
-    if (
-        error
-        || !existe
-    )
-    {
-        return false;
-    }
-
-    const bool esArchivo =
-        std::filesystem::is_regular_file(
-            ruta,
-            error
-        );
-
-    if (
-        error
-        || !esArchivo
-    )
-    {
-        return false;
-    }
-
-    const std::uintmax_t tamano =
-        std::filesystem::file_size(
-            ruta,
-            error
-        );
-
-    return
-        !error
-        && tamano > 0;
 }
 
 std::string ClienteAPI::convertirDecimal(
@@ -530,13 +551,16 @@ float ClienteAPI::normalizarScoreSVM(
      * score 2.0 -> 0.88
      * score 3.0 -> 0.95
      *
-     * No equivale a una probabilidad calibrada.
+     * Este valor no representa una probabilidad
+     * estadísticamente calibrada.
      */
     const float confianza =
         1.0F
         / (
             1.0F
-            + std::exp(-scoreSvm)
+            + std::exp(
+                  -scoreSvm
+              )
         );
 
     return std::clamp(
@@ -559,22 +583,44 @@ bool ClienteAPI::verificarEvento(
         return false;
     }
 
-    if (!archivoValido(evento.rutaImagen))
+    if (evento.imagenDatos.empty())
     {
         error =
-            "La imagen no existe, está vacía o "
-            "no es un archivo regular: "
-            + evento.rutaImagen.string();
+            "La imagen almacenada en RAM está vacía.";
 
         return false;
     }
 
-    if (!archivoValido(evento.rutaVideo))
+    if (evento.videoDatos.empty())
     {
         error =
-            "El video no existe, está vacío o "
-            "no es un archivo regular: "
-            + evento.rutaVideo.string();
+            "El video almacenado en RAM está vacío.";
+
+        return false;
+    }
+
+    const std::string nombreImagen =
+        quitarEspacios(
+            evento.nombreImagen
+        );
+
+    const std::string nombreVideo =
+        quitarEspacios(
+            evento.nombreVideo
+        );
+
+    if (nombreImagen.empty())
+    {
+        error =
+            "El nombre lógico de la imagen está vacío.";
+
+        return false;
+    }
+
+    if (nombreVideo.empty())
+    {
+        error =
+            "El nombre lógico del video está vacío.";
 
         return false;
     }
@@ -704,7 +750,7 @@ RespuestaAPI ClienteAPI::ejecutarPeticionGet(
     curl_easy_setopt(
         curl,
         CURLOPT_USERAGENT,
-        "ProyectoTaxiDetector/1.0"
+        "ProyectoTaxiDetector/2.0"
     );
 
     const CURLcode resultado =
@@ -747,8 +793,7 @@ RespuestaAPI ClienteAPI::ejecutarPeticionGet(
     if (!codigoCorrecto)
     {
         respuesta.mensajeError =
-            "La comprobación de salud respondió "
-            "con HTTP "
+            "La comprobación de salud respondió con HTTP "
             + std::to_string(
                   respuesta.codigoHttp
               );
@@ -773,8 +818,7 @@ RespuestaAPI ClienteAPI::probarConexion() const
         RespuestaAPI respuesta;
 
         respuesta.mensajeError =
-            "Configura TAXI_API_URL y "
-            "TAXI_API_KEY.";
+            "Configura TAXI_API_URL y TAXI_API_KEY.";
 
         return respuesta;
     }
@@ -800,7 +844,9 @@ RespuestaAPI ClienteAPI::enviarEvento(
         RespuestaAPI respuesta;
 
         respuesta.mensajeError =
-            std::move(error);
+            std::move(
+                error
+            );
 
         return respuesta;
     }
@@ -854,7 +900,7 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
 
     const std::string tipoMimeVideo =
         detectarMimeVideo(
-            evento.rutaVideo
+            evento.nombreVideo
         );
 
     bool formularioCorrecto = true;
@@ -879,19 +925,21 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
 
     formularioCorrecto =
         formularioCorrecto
-        && agregarArchivo(
+        && agregarArchivoMemoria(
                formulario,
                "imagen",
-               evento.rutaImagen,
+               evento.imagenDatos,
+               evento.nombreImagen,
                "image/jpeg"
            );
 
     formularioCorrecto =
         formularioCorrecto
-        && agregarArchivo(
+        && agregarArchivoMemoria(
                formulario,
                "video",
-               evento.rutaVideo,
+               evento.videoDatos,
+               evento.nombreVideo,
                tipoMimeVideo.c_str()
            );
 
@@ -917,8 +965,8 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
     if (!formularioCorrecto)
     {
         respuesta.mensajeError =
-            "No se pudieron construir todos los "
-            "campos multipart.";
+            "No se pudieron construir todos "
+            "los campos multipart.";
 
         curl_mime_free(
             formulario
@@ -944,8 +992,8 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
            );
 
     /*
-     * Evita que libcurl espere una respuesta provisional
-     * HTTP 100 Continue antes de subir los archivos.
+     * Evita esperar una respuesta provisional
+     * HTTP 100 Continue antes de enviar los datos.
      */
     encabezadosCorrectos =
         encabezadosCorrectos
@@ -958,7 +1006,8 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
         encabezadosCorrectos
         && agregarEncabezado(
                encabezados,
-               "X-API-Key: " + apiKey_
+               "X-API-Key: "
+                   + apiKey_
            );
 
     if (!encabezadosCorrectos)
@@ -982,7 +1031,8 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
     }
 
     const std::string urlAlerta =
-        urlBase_ + "/api/v1/alerta";
+        urlBase_
+        + "/api/v1/alerta";
 
     curl_easy_setopt(
         curl,
@@ -1053,14 +1103,14 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
     curl_easy_setopt(
         curl,
         CURLOPT_USERAGENT,
-        "ProyectoTaxiDetector/1.0"
+        "ProyectoTaxiDetector/2.0"
     );
 
     std::cout
         << '\n'
         << "========================================"
         << '\n'
-        << "ENVIANDO ALERTA A LA API PYTHON"
+        << "ENVIANDO ALERTA DESDE MEMORIA RAM"
         << '\n'
         << "========================================"
         << '\n'
@@ -1081,11 +1131,29 @@ RespuestaAPI ClienteAPI::ejecutarPeticionEvento(
         << "Fecha y hora: "
         << evento.fechaHora
         << '\n'
-        << "Imagen: "
-        << evento.rutaImagen
+        << "Imagen en RAM: "
+        << evento.imagenDatos.size()
+        << " bytes ("
+        << std::fixed
+        << std::setprecision(2)
+        << convertirBytesAMegabytes(
+               evento.imagenDatos.size()
+           )
+        << " MB)"
         << '\n'
-        << "Video: "
-        << evento.rutaVideo
+        << "Video en RAM: "
+        << evento.videoDatos.size()
+        << " bytes ("
+        << convertirBytesAMegabytes(
+               evento.videoDatos.size()
+           )
+        << " MB)"
+        << '\n'
+        << "Nombre imagen: "
+        << evento.nombreImagen
+        << '\n'
+        << "Nombre video: "
+        << evento.nombreVideo
         << '\n'
         << "========================================"
         << '\n';

@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
-
 
 from telegram import Update
 from telegram.ext import (
@@ -20,20 +23,22 @@ from config import (
     TOKEN,
     YOLO_CONFIDENCE,
     YOLO_DEVICE,
+    YOLO_FILTER_ONLY_TARGET,
     YOLO_IMAGE_SIZE,
     YOLO_MODEL,
     YOLO_TARGET_CLASS,
 )
-
-from yolo_processor import YOLOSegmenter
 from video_handler import register_video_module
+from yolo_processor import YOLOSegmenter
 
 
 # =========================================================
 # RUTAS DEL PROYECTO
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(
+    __file__
+).resolve().parent
 
 TEST_IMAGE_PATH = (
     BASE_DIR
@@ -42,27 +47,16 @@ TEST_IMAGE_PATH = (
     / "matriz.png"
 )
 
-RECEIVED_IMAGES_DIR = (
-    BASE_DIR
-    / "input"
-    / "received"
-    / "images"
-)
-
-OUTPUT_IMAGES_DIR = (
-    BASE_DIR
-    / "output"
-    / "images"
-)
-
 
 # =========================================================
 # CONFIGURACIÓN DE ARCHIVOS
 # =========================================================
 
-# Telegram permite descargar archivos de hasta 20 MB
-# mediante la API pública. Dejamos un pequeño margen.
-MAX_DOWNLOAD_BYTES = 19 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = (
+    19
+    * 1024
+    * 1024
+)
 
 SUPPORTED_IMAGE_EXTENSIONS = {
     ".jpg",
@@ -81,7 +75,7 @@ MIME_EXTENSION_MAP = {
 
 
 # =========================================================
-# LOGS
+# CONFIGURACIÓN DE LOGS
 # =========================================================
 
 logging.basicConfig(
@@ -94,18 +88,18 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(
+    __name__
+)
 
 
 # =========================================================
 # FUNCIONES AUXILIARES
 # =========================================================
 
-def create_event_paths(
-    extension: str,
-) -> tuple[str, Path, Path]:
+def create_event_id() -> str:
     """
-    Genera un identificador y rutas únicas para cada evento.
+    Genera un identificador único para cada evento.
     """
 
     timestamp = datetime.now().strftime(
@@ -114,19 +108,7 @@ def create_event_paths(
 
     random_id = uuid4().hex[:8]
 
-    event_id = f"{timestamp}_{random_id}"
-
-    input_path = (
-        RECEIVED_IMAGES_DIR
-        / f"entrada_{event_id}{extension}"
-    )
-
-    output_path = (
-        OUTPUT_IMAGES_DIR
-        / f"segmentada_{event_id}.jpg"
-    )
-
-    return event_id, input_path, output_path
+    return f"{timestamp}_{random_id}"
 
 
 def get_document_extension(
@@ -134,12 +116,14 @@ def get_document_extension(
     mime_type: str | None,
 ) -> str | None:
     """
-    Determina si una imagen enviada como documento
-    tiene un formato compatible.
+    Determina la extensión de una imagen enviada
+    como documento.
     """
 
     if file_name:
-        extension = Path(file_name).suffix.lower()
+        extension = Path(
+            file_name
+        ).suffix.lower()
 
         if extension in SUPPORTED_IMAGE_EXTENSIONS:
             return extension
@@ -152,113 +136,243 @@ def get_document_extension(
     return None
 
 
+def sanitize_filename(
+    file_name: str | None,
+    default_name: str,
+) -> str:
+    """
+    Limpia el nombre de un archivo recibido.
+    """
+
+    if not file_name:
+        return default_name
+
+    clean_name = Path(
+        file_name
+    ).name.strip()
+
+    return clean_name or default_name
+
+
+def shorten_text(
+    text: str,
+    maximum_length: int = 300,
+) -> str:
+    """
+    Reduce textos demasiado largos.
+    """
+
+    if len(text) <= maximum_length:
+        return text
+
+    return (
+        text[: maximum_length - 3]
+        + "..."
+    )
+
+
+def create_memory_buffer(
+    data: bytes,
+    filename: str,
+) -> BytesIO:
+    """
+    Crea un archivo virtual en memoria RAM.
+    """
+
+    if not data:
+        raise ValueError(
+            f"El archivo {filename} está vacío."
+        )
+
+    buffer = BytesIO(
+        data
+    )
+
+    buffer.name = filename
+    buffer.seek(0)
+
+    return buffer
+
+
 def build_metrics_caption(
-    metrics: dict,
+    metrics: dict[str, Any],
     event_id: str,
 ) -> str:
     """
-    Crea el texto que acompañará a la imagen segmentada.
+    Construye el mensaje con las métricas YOLO.
     """
+
+    classes_summary = shorten_text(
+        str(
+            metrics.get(
+                "classes_summary",
+                "Sin información",
+            )
+        ),
+        maximum_length=250,
+    )
 
     return (
         "🧠 SEGMENTACIÓN DE INSTANCIAS YOLO\n\n"
         f"Evento: {event_id}\n"
-        f"Modelo: {metrics['model']}\n"
-        f"Dispositivo: {metrics['device']}\n\n"
+        f"Modelo: "
+        f"{metrics.get('model', YOLO_MODEL)}\n"
+        f"Dispositivo: "
+        f"{metrics.get('device', YOLO_DEVICE)}\n\n"
         f"Objetos detectados: "
-        f"{metrics['detections']}\n"
+        f"{metrics.get('detections', 0)}\n"
         f"Máscaras generadas: "
-        f"{metrics['masks']}\n"
+        f"{metrics.get('masks', 0)}\n"
         f"Confianza promedio: "
-        f"{metrics['confidence_average'] * 100:.2f} %\n"
+        f"{float(metrics.get('confidence_average', 0.0)) * 100:.2f} %\n"
         f"Confianza máxima: "
-        f"{metrics['confidence_maximum'] * 100:.2f} %\n\n"
+        f"{float(metrics.get('confidence_maximum', 0.0)) * 100:.2f} %\n\n"
         f"FPS de inferencia: "
-        f"{metrics['inference_fps']:.2f}\n"
+        f"{float(metrics.get('inference_fps', 0.0)):.2f}\n"
         f"Tiempo de inferencia: "
-        f"{metrics['inference_ms']:.2f} ms\n"
+        f"{float(metrics.get('inference_ms', 0.0)):.2f} ms\n"
         f"Tiempo total: "
-        f"{metrics['total_seconds']:.3f} s\n\n"
+        f"{float(metrics.get('total_seconds', 0.0)):.3f} s\n\n"
         f"RAM del proceso: "
-        f"{metrics['ram_after_mb']:.2f} MB\n"
+        f"{float(metrics.get('ram_after_mb', 0.0)):.2f} MB\n"
         f"RAM total utilizada: "
-        f"{metrics['system_ram_percent']:.2f} %\n\n"
+        f"{float(metrics.get('system_ram_percent', 0.0)):.2f} %\n\n"
         f"Clases detectadas:\n"
-        f"{metrics['classes_summary']}"
+        f"{classes_summary}"
     )
 
+
+# =========================================================
+# ENVÍO DE IMÁGENES DESDE RAM
+# =========================================================
+
+async def send_image_from_memory(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    image_data: bytes,
+    filename: str,
+    caption: str,
+) -> None:
+    """
+    Envía una imagen almacenada en memoria RAM.
+    """
+
+    image_buffer = create_memory_buffer(
+        image_data,
+        filename,
+    )
+
+    try:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image_buffer,
+            caption=caption,
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
+        )
+
+    finally:
+        image_buffer.close()
+
+
+# =========================================================
+# PROCESAMIENTO YOLO EN RAM
+# =========================================================
 
 async def process_and_send_image(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
-    input_path: Path,
-    output_path: Path,
+    image_data: bytes,
+    image_filename: str,
     event_id: str,
     status_message,
     source: str,
-) -> dict:
+) -> dict[str, Any]:
     """
-    Ejecuta YOLO y envía la imagen original y la
-    imagen segmentada al usuario.
+    Procesa una imagen completamente en memoria RAM.
+
+    Flujo:
+        1. Recibe bytes.
+        2. Ejecuta YOLO.
+        3. Obtiene la imagen segmentada como bytes.
+        4. Envía ambas imágenes a Telegram.
     """
 
     segmenter: YOLOSegmenter = (
-        context.application.bot_data["segmenter"]
+        context.application.bot_data[
+            "segmenter"
+        ]
+    )
+
+    yolo_lock: asyncio.Lock = (
+        context.application.bot_data[
+            "yolo_lock"
+        ]
     )
 
     await status_message.edit_text(
         "🧠 Ejecutando YOLO11-seg...\n\n"
         f"Evento: {event_id}\n"
+        "Procesamiento: memoria RAM\n\n"
         "La primera inferencia puede tardar más."
     )
 
-    # La inferencia es bloqueante, por eso se ejecuta
-    # en un hilo separado.
-    metrics = await asyncio.to_thread(
-        segmenter.process_image,
-        input_path,
-        output_path,
-    )
+    # Evita que varias imágenes utilicen el mismo
+    # modelo YOLO simultáneamente.
+    async with yolo_lock:
+        (
+            segmented_image_data,
+            metrics,
+        ) = await asyncio.to_thread(
+            segmenter.process_image,
+            image_data,
+        )
+
+    if not segmented_image_data:
+        raise RuntimeError(
+            "YOLO generó una imagen segmentada vacía."
+        )
 
     # =====================================================
     # ENVIAR IMAGEN ORIGINAL
     # =====================================================
 
-    with input_path.open("rb") as original_image:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=original_image,
-            caption=(
-                "🚨 PRUEBA DE ALERTA DE TRÁFICO\n\n"
-                f"Vehículo objetivo configurado:\n"
-                f"{TARGET_VEHICLE}\n\n"
-                f"Fuente: {source}\n"
-                f"Evento: {event_id}\n\n"
-                "Estado: imagen recibida correctamente.\n"
-                "Esta prueba todavía no proviene del "
-                "detector clásico en C++."
-            ),
-        )
+    await send_image_from_memory(
+        context=context,
+        chat_id=chat_id,
+        image_data=image_data,
+        filename=image_filename,
+        caption=(
+            "🚨 PRUEBA DE ALERTA DE TRÁFICO\n\n"
+            "Vehículo objetivo configurado:\n"
+            f"{TARGET_VEHICLE}\n\n"
+            f"Fuente: {source}\n"
+            f"Evento: {event_id}\n\n"
+            "Estado: imagen recibida correctamente.\n"
+            "Procesamiento: memoria RAM."
+        ),
+    )
 
     # =====================================================
     # ENVIAR IMAGEN SEGMENTADA
     # =====================================================
 
-    caption = build_metrics_caption(
-        metrics,
-        event_id,
+    await send_image_from_memory(
+        context=context,
+        chat_id=chat_id,
+        image_data=segmented_image_data,
+        filename="imagen_segmentada.jpg",
+        caption=build_metrics_caption(
+            metrics,
+            event_id,
+        ),
     )
-
-    with output_path.open("rb") as segmented_image:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=segmented_image,
-            caption=caption,
-        )
 
     await status_message.edit_text(
         "✅ Procesamiento terminado correctamente.\n\n"
-        f"Evento: {event_id}"
+        f"Evento: {event_id}\n"
+        "Almacenamiento permanente: desactivado."
     )
 
     return metrics
@@ -272,13 +386,18 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Muestra la información principal del bot.
+    """
 
     message = (
         "🚗 BOT DE MONITOREO DE TRÁFICO\n\n"
         "El sistema está funcionando correctamente.\n\n"
         "Puedes enviarme directamente una fotografía "
         "o una imagen como archivo y ejecutaré la "
-        "segmentación de instancias.\n\n"
+        "segmentación de instancias con YOLO.\n\n"
+        "Las imágenes se procesan en memoria RAM "
+        "sin almacenamiento permanente.\n\n"
         "Comandos disponibles:\n\n"
         "/start - Mostrar información\n"
         "/id - Mostrar identificador del chat\n"
@@ -288,9 +407,10 @@ async def start(
         "sin utilizar comandos."
     )
 
-    await update.effective_message.reply_text(
-        message
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            message
+        )
 
 
 # =========================================================
@@ -301,6 +421,15 @@ async def show_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Muestra el identificador del chat actual.
+    """
+
+    if (
+        update.effective_chat is None
+        or update.effective_message is None
+    ):
+        return
 
     chat_id = update.effective_chat.id
 
@@ -323,6 +452,15 @@ async def send_test_photo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Envía matriz.png como fotografía de prueba.
+    """
+
+    if (
+        update.effective_chat is None
+        or update.effective_message is None
+    ):
+        return
 
     if not TEST_IMAGE_PATH.is_file():
         await update.effective_message.reply_text(
@@ -332,15 +470,20 @@ async def send_test_photo(
         return
 
     try:
-        with TEST_IMAGE_PATH.open("rb") as photo:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=photo,
-                caption=(
-                    "📸 Imagen local de prueba.\n\n"
-                    f"Archivo: {TEST_IMAGE_PATH.name}"
-                ),
-            )
+        image_data = await asyncio.to_thread(
+            TEST_IMAGE_PATH.read_bytes
+        )
+
+        await send_image_from_memory(
+            context=context,
+            chat_id=update.effective_chat.id,
+            image_data=image_data,
+            filename=TEST_IMAGE_PATH.name,
+            caption=(
+                "📸 Imagen local de prueba.\n\n"
+                f"Archivo: {TEST_IMAGE_PATH.name}"
+            ),
+        )
 
     except Exception:
         logger.exception(
@@ -360,6 +503,15 @@ async def segment_test_image(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Procesa matriz.png con YOLO en memoria RAM.
+    """
+
+    if (
+        update.effective_chat is None
+        or update.effective_message is None
+    ):
+        return
 
     if not TEST_IMAGE_PATH.is_file():
         await update.effective_message.reply_text(
@@ -370,29 +522,31 @@ async def segment_test_image(
 
     event_id = (
         "prueba_"
-        + datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-    )
-
-    output_path = (
-        OUTPUT_IMAGES_DIR
-        / f"segmentada_{event_id}.jpg"
+        + create_event_id()
     )
 
     status_message = (
         await update.effective_message.reply_text(
             "📥 Imagen local encontrada.\n"
-            "Preparando segmentación..."
+            "Preparando segmentación en RAM..."
         )
     )
 
     try:
+        image_data = await asyncio.to_thread(
+            TEST_IMAGE_PATH.read_bytes
+        )
+
+        if not image_data:
+            raise ValueError(
+                "matriz.png está vacía."
+            )
+
         await process_and_send_image(
             context=context,
             chat_id=update.effective_chat.id,
-            input_path=TEST_IMAGE_PATH,
-            output_path=output_path,
+            image_data=image_data,
+            image_filename=TEST_IMAGE_PATH.name,
             event_id=event_id,
             status_message=status_message,
             source="comando /segmentar",
@@ -405,7 +559,8 @@ async def segment_test_image(
 
         await status_message.edit_text(
             "❌ Error durante la segmentación.\n\n"
-            f"Detalle: {error}"
+            f"Detalle: "
+            f"{shorten_text(str(error), 500)}"
         )
 
 
@@ -417,35 +572,42 @@ async def receive_image(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Descarga una imagen desde Telegram directamente
+    a memoria RAM y la procesa con YOLO.
+    """
 
     message = update.effective_message
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+
+    if message is None or chat is None:
+        return
 
     attachment = None
-    extension = None
-    file_size = None
-    source = None
+    extension: str | None = None
+    file_size: int | None = None
+    source = ""
+    original_filename: str | None = None
 
     # =====================================================
     # IMAGEN ENVIADA COMO FOTOGRAFÍA
     # =====================================================
 
     if message.photo:
-        # Telegram entrega varias resoluciones.
-        # La última normalmente es la de mayor tamaño.
         attachment = message.photo[-1]
         extension = ".jpg"
         file_size = attachment.file_size
         source = "fotografía enviada por Telegram"
 
     # =====================================================
-    # IMAGEN ENVIADA COMO ARCHIVO
+    # IMAGEN ENVIADA COMO DOCUMENTO
     # =====================================================
 
     elif message.document:
         attachment = message.document
         file_size = attachment.file_size
         source = "imagen enviada como archivo"
+        original_filename = attachment.file_name
 
         extension = get_document_extension(
             file_name=attachment.file_name,
@@ -475,7 +637,10 @@ async def receive_image(
         file_size is not None
         and file_size > MAX_DOWNLOAD_BYTES
     ):
-        size_mb = file_size / (1024 * 1024)
+        size_mb = (
+            file_size
+            / (1024 * 1024)
+        )
 
         await message.reply_text(
             "❌ La imagen es demasiado grande.\n\n"
@@ -484,43 +649,57 @@ async def receive_image(
         )
         return
 
-    event_id, input_path, output_path = (
-        create_event_paths(extension)
+    event_id = create_event_id()
+
+    image_filename = sanitize_filename(
+        original_filename,
+        f"imagen_{event_id}{extension}",
     )
 
     status_message = await message.reply_text(
         "📥 Imagen recibida.\n\n"
         f"Evento: {event_id}\n"
-        "Descargando archivo..."
+        "Descargando directamente a memoria RAM..."
     )
 
     try:
-        # Obtener el archivo desde Telegram.
+        # Obtener referencia al archivo de Telegram.
         telegram_file = await context.bot.get_file(
             attachment.file_id
         )
 
-        # Descargarlo en la carpeta del proyecto.
-        await telegram_file.download_to_drive(
-            custom_path=input_path
+        # Descargar directamente como bytearray.
+        downloaded_data = (
+            await telegram_file.download_as_bytearray()
         )
+
+        image_data = bytes(
+            downloaded_data
+        )
+
+        if not image_data:
+            raise ValueError(
+                "Telegram devolvió una imagen vacía."
+            )
+
+        if len(image_data) > MAX_DOWNLOAD_BYTES:
+            raise ValueError(
+                "La imagen descargada supera "
+                "el tamaño permitido."
+            )
 
         logger.info(
-            "Imagen descargada: %s",
-            input_path,
+            "Imagen recibida en RAM. "
+            "Evento: %s. Tamaño: %.2f MB.",
+            event_id,
+            len(image_data) / (1024 * 1024),
         )
-
-        if not input_path.is_file():
-            raise FileNotFoundError(
-                "Telegram informó una descarga correcta, "
-                "pero el archivo no existe en disco."
-            )
 
         await process_and_send_image(
             context=context,
-            chat_id=chat_id,
-            input_path=input_path,
-            output_path=output_path,
+            chat_id=chat.id,
+            image_data=image_data,
+            image_filename=image_filename,
             event_id=event_id,
             status_message=status_message,
             source=source,
@@ -539,7 +718,8 @@ async def receive_image(
         await status_message.edit_text(
             "❌ No fue posible procesar la imagen.\n\n"
             f"Evento: {event_id}\n"
-            f"Detalle: {error}"
+            f"Detalle: "
+            f"{shorten_text(str(error), 500)}"
         )
 
 
@@ -551,6 +731,12 @@ async def reply_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Responde a mensajes de texto normales.
+    """
+
+    if update.effective_message is None:
+        return
 
     await update.effective_message.reply_text(
         "📨 Mensaje recibido.\n\n"
@@ -567,10 +753,20 @@ async def handle_error(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Registra errores no controlados del bot.
+    """
 
-    logger.exception(
+    logger.error(
         "Error no controlado procesando actualización.",
-        exc_info=context.error,
+        exc_info=(
+            context.error
+            if isinstance(
+                context.error,
+                BaseException,
+            )
+            else None
+        ),
     )
 
 
@@ -579,21 +775,14 @@ async def handle_error(
 # =========================================================
 
 def main() -> None:
+    """
+    Configura e inicia el bot de Telegram.
+    """
 
     if not TOKEN:
         raise ValueError(
             "El TOKEN de Telegram no está configurado."
         )
-
-    RECEIVED_IMAGES_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    OUTPUT_IMAGES_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
     # Cargar YOLO una sola vez.
     segmenter = YOLOSegmenter(
@@ -602,7 +791,9 @@ def main() -> None:
         device=YOLO_DEVICE,
         image_size=YOLO_IMAGE_SIZE,
         target_class_name=YOLO_TARGET_CLASS,
-        filter_only_target=YOLO_FILTER_ONLY_TARGET,
+        filter_only_target=(
+            YOLO_FILTER_ONLY_TARGET
+        ),
     )
 
     app: Application = (
@@ -613,23 +804,42 @@ def main() -> None:
 
     app.bot_data["segmenter"] = segmenter
 
+    # Evita inferencias simultáneas sobre
+    # la misma instancia del modelo.
+    app.bot_data["yolo_lock"] = (
+        asyncio.Lock()
+    )
+
+    # Registrar el módulo encargado de videos.
     register_video_module(
-    app=app,
-    segmenter=segmenter,
-    base_dir=BASE_DIR,
-)
+        app=app,
+        segmenter=segmenter,
+        base_dir=BASE_DIR,
+    )
 
-    # Comandos
+    # =====================================================
+    # COMANDOS
+    # =====================================================
+
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("id", show_chat_id)
+        CommandHandler(
+            "id",
+            show_chat_id,
+        )
     )
 
     app.add_handler(
-        CommandHandler("foto", send_test_photo)
+        CommandHandler(
+            "foto",
+            send_test_photo,
+        )
     )
 
     app.add_handler(
@@ -639,7 +849,10 @@ def main() -> None:
         )
     )
 
-    # Fotografías e imágenes enviadas como archivo
+    # =====================================================
+    # IMÁGENES
+    # =====================================================
+
     app.add_handler(
         MessageHandler(
             filters.PHOTO
@@ -648,7 +861,10 @@ def main() -> None:
         )
     )
 
-    # Texto normal
+    # =====================================================
+    # TEXTO NORMAL
+    # =====================================================
+
     app.add_handler(
         MessageHandler(
             filters.TEXT
@@ -657,7 +873,9 @@ def main() -> None:
         )
     )
 
-    app.add_error_handler(handle_error)
+    app.add_error_handler(
+        handle_error
+    )
 
     print()
     print("=" * 65)
@@ -666,15 +884,17 @@ def main() -> None:
     print(f"Modelo YOLO       : {YOLO_MODEL}")
     print(f"Dispositivo       : {YOLO_DEVICE}")
     print(f"Confianza mínima  : {YOLO_CONFIDENCE}")
-    print(f"Imágenes recibidas: {RECEIVED_IMAGES_DIR}")
-    print(f"Resultados        : {OUTPUT_IMAGES_DIR}")
+    print("Procesamiento      : memoria RAM")
+    print("Archivos permanentes: desactivados")
     print()
     print("Envía una fotografía directamente al bot.")
     print("Presiona Ctrl + C para detenerlo.")
     print("=" * 65)
     print()
 
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=False
+    )
 
 
 if __name__ == "__main__":

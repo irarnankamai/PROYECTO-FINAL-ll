@@ -1,12 +1,27 @@
 #pragma once
 
-#include <filesystem>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 struct DatosEventoTaxi
 {
-    std::filesystem::path rutaImagen;
-    std::filesystem::path rutaVideo;
+    /*
+     * Datos binarios almacenados en memoria RAM.
+     *
+     * imagenDatos debe contener una imagen JPEG válida.
+     * videoDatos debe contener un video MP4 válido.
+     */
+    std::vector<unsigned char> imagenDatos;
+    std::vector<unsigned char> videoDatos;
+
+    /*
+     * Nombres enviados dentro del formulario multipart.
+     *
+     * No representan rutas físicas en el disco.
+     */
+    std::string nombreImagen = "captura_taxi.jpg";
+    std::string nombreVideo = "evidencia_taxi.mp4";
 
     std::string vehiculo = "Taxi amarillo";
     std::string camara = "Cámara principal";
@@ -85,11 +100,6 @@ private:
         const DatosEventoTaxi& evento,
         std::string& error
     ) const;
-
-    [[nodiscard]]
-    static bool archivoValido(
-        const std::filesystem::path& ruta
-    );
 
     [[nodiscard]]
     static std::string limpiarUrl(

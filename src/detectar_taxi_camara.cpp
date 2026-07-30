@@ -17,49 +17,47 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace
 {
-/*
- * Resolución optimizada para la cámara y el detector.
- *
- * 640x360 reduce a una cuarta parte la cantidad de píxeles
- * respecto a 1280x720, sin cambiar el modelo ni las clases
- * usadas por la integración con FastAPI y Telegram.
- */
 constexpr int ANCHO_CAMARA = 640;
 constexpr int ALTO_CAMARA = 360;
 
 constexpr double FPS_CAMARA_DESEADO = 30.0;
 constexpr double DURACION_VIDEO_SEGUNDOS = 5.0;
 
+constexpr int BITRATE_VIDEO_BITS_SEGUNDO = 2'000'000;
+constexpr int CALIDAD_JPEG = 90;
+
 constexpr int INTERVALO_DETECCION_PREDETERMINADO = 10;
 
-/*
- * Cantidad de resultados consecutivos sin taxis necesarios
- * para permitir un nuevo evento.
- */
 constexpr int DETECCIONES_POSITIVAS_PARA_CONFIRMAR = 2;
 constexpr float SCORE_MINIMO_PARA_EVENTO = 1.0F;
 
 constexpr int RESULTADOS_VACIOS_PARA_REACTIVAR = 5;
 constexpr double SEGUNDOS_SIN_TAXI_PARA_REACTIVAR = 8.0;
 
-/*
- * Recuperación básica cuando una cámara USB deja de entregar
- * frames temporalmente.
- */
 constexpr int LECTURAS_FALLIDAS_PARA_RECONECTAR = 5;
 constexpr int INTENTOS_MAXIMOS_RECONEXION = 3;
 constexpr int ESPERA_RECONEXION_MS = 500;
 
 constexpr int ALTO_PANEL = 185;
 
+/*
+ * Conserva toda la evidencia del evento en memoria RAM.
+ *
+ * imagenJpeg:
+ * imagen JPEG codificada por Capturador.
+ *
+ * videoMp4:
+ * video MP4 codificado por GrabadorVideo.
+ */
 struct DatosEventoActual
 {
-    std::filesystem::path rutaImagen;
-    std::filesystem::path rutaVideo;
+    std::vector<unsigned char> imagenJpeg;
+    std::vector<unsigned char> videoMp4;
 
     std::string fechaHora;
 
@@ -70,8 +68,11 @@ struct DatosEventoActual
 
     void limpiar()
     {
-        rutaImagen.clear();
-        rutaVideo.clear();
+        imagenJpeg.clear();
+        imagenJpeg.shrink_to_fit();
+
+        videoMp4.clear();
+        videoMp4.shrink_to_fit();
 
         fechaHora.clear();
 
@@ -95,7 +96,8 @@ int convertirEntero(
 
     try
     {
-        const int valor = std::stoi(texto);
+        const int valor =
+            std::stoi(texto);
 
         return std::max(
             valor,
@@ -160,12 +162,24 @@ float obtenerMejorScore(
         std::max_element(
             detecciones.begin(),
             detecciones.end(),
-            [](const TaxiDetectado& izquierda,
-               const TaxiDetectado& derecha)
+            [](
+                const TaxiDetectado& izquierda,
+                const TaxiDetectado& derecha
+            )
             {
-                return izquierda.score < derecha.score;
+                return
+                    izquierda.score
+                    < derecha.score;
             }
         );
+
+    if (
+        mejor == detecciones.end()
+        || !std::isfinite(mejor->score)
+    )
+    {
+        return 0.0F;
+    }
 
     return mejor->score;
 }
@@ -198,8 +212,7 @@ double obtenerMemoriaRAMMegabytes()
             return
                 static_cast<double>(
                     valorKilobytes
-                ) /
-                1024.0;
+                ) / 1024.0;
         }
 
         std::string restoLinea;
@@ -215,23 +228,24 @@ double obtenerMemoriaRAMMegabytes()
     return 0.0;
 }
 
-/*
- * Aplica únicamente propiedades de VideoCapture.
- *
- * No modifica DetectorHOG, Capturador, GrabadorVideo ni
- * ClienteAPI, por lo que no cambia el contrato con FastAPI.
- */
+double convertirBytesAMegabytes(
+    std::size_t bytes
+)
+{
+    constexpr double BYTES_POR_MEGABYTE =
+        1024.0 * 1024.0;
+
+    return
+        static_cast<double>(bytes)
+        / BYTES_POR_MEGABYTE;
+}
+
 void configurarCamara(
     cv::VideoCapture& camara
 )
 {
 #if defined(__linux__)
 
-    /*
-     * La cámara Fullhan confirmó soporte para YUYV.
-     * Si otra cámara no acepta esta propiedad, OpenCV
-     * conservará el formato que el dispositivo permita.
-     */
     camara.set(
         cv::CAP_PROP_FOURCC,
         cv::VideoWriter::fourcc(
@@ -259,12 +273,6 @@ void configurarCamara(
         FPS_CAMARA_DESEADO
     );
 
-    /*
-     * Reduce la posibilidad de procesar frames antiguos
-     * acumulados en el búfer de captura.
-     *
-     * Algunos backends pueden ignorar esta propiedad.
-     */
     camara.set(
         cv::CAP_PROP_BUFFERSIZE,
         1
@@ -386,10 +394,6 @@ bool reconectarCamara(
 
         primerFrame.release();
 
-        /*
-         * Se descartan unos pocos frames iniciales porque
-         * algunas webcams entregan frames vacíos al abrirse.
-         */
         for (
             int descarte = 0;
             descarte < 5;
@@ -444,15 +448,13 @@ void dibujarDetecciones(
         frame.rows
     );
 
+    std::size_t numeroTaxi = 0;
+
     for (
-        std::size_t indice = 0;
-        indice < detecciones.size();
-        ++indice
+        const TaxiDetectado& deteccion :
+        detecciones
     )
     {
-        const TaxiDetectado& deteccion =
-            detecciones[indice];
-
         const cv::Rect cajaValida =
             deteccion.caja
             & limitesImagen;
@@ -465,23 +467,34 @@ void dibujarDetecciones(
             continue;
         }
 
+        ++numeroTaxi;
+
         cv::rectangle(
             frame,
             cajaValida,
-            cv::Scalar(0, 255, 0),
+            cv::Scalar(
+                0,
+                255,
+                0
+            ),
             3,
             cv::LINE_AA
         );
+
+        const float score =
+            std::isfinite(deteccion.score)
+                ? deteccion.score
+                : 0.0F;
 
         std::ostringstream etiqueta;
 
         etiqueta
             << "Taxi "
-            << indice + 1
+            << numeroTaxi
             << " | score: "
             << std::fixed
             << std::setprecision(2)
-            << deteccion.score;
+            << score;
 
         int lineaBase = 0;
 
@@ -519,6 +532,18 @@ void dibujarDetecciones(
                     frame.cols
                         - tamanoTexto.width
                         - 12
+                )
+            );
+
+        textoY =
+            std::clamp(
+                textoY,
+                tamanoTexto.height + 6,
+                std::max(
+                    tamanoTexto.height + 6,
+                    frame.rows
+                        - lineaBase
+                        - 6
                 )
             );
 
@@ -560,7 +585,11 @@ void dibujarDetecciones(
                     anchoFondo,
                     altoFondo
                 ),
-                cv::Scalar(0, 130, 0),
+                cv::Scalar(
+                    0,
+                    130,
+                    0
+                ),
                 cv::FILLED
             );
         }
@@ -574,7 +603,11 @@ void dibujarDetecciones(
             ),
             cv::FONT_HERSHEY_SIMPLEX,
             0.65,
-            cv::Scalar(255, 255, 255),
+            cv::Scalar(
+                255,
+                255,
+                255
+            ),
             2,
             cv::LINE_AA
         );
@@ -611,10 +644,6 @@ void dibujarPanelEstado(
             frame.rows
         );
 
-    /*
-     * Antes se clonaba el frame completo para crear el panel.
-     * Ahora solo se copia la región ocupada por el panel.
-     */
     const cv::Rect regionPanel(
         0,
         0,
@@ -638,7 +667,11 @@ void dibujarPanelEstado(
             capa.cols,
             capa.rows
         ),
-        cv::Scalar(0, 0, 0),
+        cv::Scalar(
+            0,
+            0,
+            0
+        ),
         cv::FILLED
     );
 
@@ -661,27 +694,33 @@ void dibujarPanelEstado(
         << " | Taxis: "
         << detecciones.size()
         << " | RAM: "
-        << std::setprecision(1)
         << memoriaRAM
         << " MB";
 
     cv::putText(
         frame,
         linea1.str(),
-        cv::Point(20, 28),
+        cv::Point(
+            20,
+            28
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
         0.65,
-        cv::Scalar(255, 255, 255),
+        cv::Scalar(
+            255,
+            255,
+            255
+        ),
         2,
         cv::LINE_AA
     );
-
-    std::ostringstream linea2;
 
     const double fpsDetector =
         ultimoTiempoDeteccion > 0.0
             ? 1.0 / ultimoTiempoDeteccion
             : 0.0;
+
+    std::ostringstream linea2;
 
     linea2
         << "Detector: "
@@ -700,12 +739,23 @@ void dibujarPanelEstado(
     cv::putText(
         frame,
         linea2.str(),
-        cv::Point(20, 58),
+        cv::Point(
+            20,
+            58
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
         0.62,
         deteccionEnCurso
-            ? cv::Scalar(0, 200, 255)
-            : cv::Scalar(0, 255, 0),
+            ? cv::Scalar(
+                  0,
+                  200,
+                  255
+              )
+            : cv::Scalar(
+                  0,
+                  255,
+                  0
+              ),
         2,
         cv::LINE_AA
     );
@@ -715,17 +765,19 @@ void dibujarPanelEstado(
     if (grabador.estaGrabando())
     {
         linea3
-            << "Estado: GRABANDO | Restante: "
+            << "Estado: GRABANDO EN RAM | Restante: "
             << std::fixed
             << std::setprecision(1)
             << grabador.obtenerTiempoRestante()
             << " s | Frames: "
-            << grabador.obtenerFramesGrabados();
+            << grabador.obtenerFramesGrabados()
+            << '/'
+            << grabador.obtenerFramesObjetivo();
     }
     else if (envioApiEnCurso)
     {
         linea3
-            << "Estado: ENVIANDO EVENTO A FASTAPI";
+            << "Estado: ENVIANDO RAM A FASTAPI";
     }
     else if (eventoActivo)
     {
@@ -741,12 +793,23 @@ void dibujarPanelEstado(
     cv::putText(
         frame,
         linea3.str(),
-        cv::Point(20, 88),
+        cv::Point(
+            20,
+            88
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
         0.62,
         grabador.estaGrabando()
-            ? cv::Scalar(0, 0, 255)
-            : cv::Scalar(255, 255, 255),
+            ? cv::Scalar(
+                  0,
+                  0,
+                  255
+              )
+            : cv::Scalar(
+                  255,
+                  255,
+                  255
+              ),
         2,
         cv::LINE_AA
     );
@@ -756,9 +819,9 @@ void dibujarPanelEstado(
     linea4
         << "Eventos: "
         << totalEventos
-        << " | Capturas: "
+        << " | Capturas RAM: "
         << totalCapturas
-        << " | Videos: "
+        << " | Videos RAM: "
         << totalVideos
         << " | Enviados: "
         << totalEnviosExitosos;
@@ -766,10 +829,17 @@ void dibujarPanelEstado(
     cv::putText(
         frame,
         linea4.str(),
-        cv::Point(20, 118),
+        cv::Point(
+            20,
+            118
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
-        0.62,
-        cv::Scalar(255, 255, 255),
+        0.60,
+        cv::Scalar(
+            255,
+            255,
+            255
+        ),
         2,
         cv::LINE_AA
     );
@@ -805,12 +875,23 @@ void dibujarPanelEstado(
     cv::putText(
         frame,
         linea5.str(),
-        cv::Point(20, 148),
+        cv::Point(
+            20,
+            148
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
         0.60,
         apiConfigurada
-            ? cv::Scalar(255, 255, 255)
-            : cv::Scalar(0, 180, 255),
+            ? cv::Scalar(
+                  255,
+                  255,
+                  255
+              )
+            : cv::Scalar(
+                  0,
+                  180,
+                  255
+              ),
         2,
         cv::LINE_AA
     );
@@ -818,10 +899,17 @@ void dibujarPanelEstado(
     cv::putText(
         frame,
         "Q o ESC: salir",
-        cv::Point(20, 176),
+        cv::Point(
+            20,
+            176
+        ),
         cv::FONT_HERSHEY_SIMPLEX,
         0.55,
-        cv::Scalar(200, 200, 200),
+        cv::Scalar(
+            200,
+            200,
+            200
+        ),
         1,
         cv::LINE_AA
     );
@@ -845,7 +933,11 @@ void dibujarPanelEstado(
                 35
             ),
             radio,
-            cv::Scalar(0, 0, 255),
+            cv::Scalar(
+                0,
+                0,
+                255
+            ),
             cv::FILLED,
             cv::LINE_AA
         );
@@ -853,7 +945,10 @@ void dibujarPanelEstado(
 }
 }
 
-int main(int argc, char* argv[])
+int main(
+    int argc,
+    char* argv[]
+)
 {
     int indiceCamara = 0;
 
@@ -880,6 +975,10 @@ int main(int argc, char* argv[])
             );
     }
 
+    /*
+     * filesystem se utiliza solamente para localizar el modelo.
+     * Las evidencias de imagen y video no se escriben en disco.
+     */
     std::error_code errorRuta;
 
     const std::filesystem::path rutaModelo =
@@ -890,7 +989,7 @@ int main(int argc, char* argv[])
 
     if (
         errorRuta
-        || !std::filesystem::exists(
+        || !std::filesystem::is_regular_file(
                rutaModelo
            )
     )
@@ -921,8 +1020,11 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    /*
+     * El capturador codifica JPEG directamente en RAM.
+     */
     Capturador capturador(
-        "captures"
+        CALIDAD_JPEG
     );
 
     if (!capturador.inicializar())
@@ -934,9 +1036,13 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    /*
+     * El grabador genera MP4 directamente en RAM mediante
+     * FFmpeg y un AVIOContext personalizado.
+     */
     GrabadorVideo grabador(
-        "videos",
-        DURACION_VIDEO_SEGUNDOS
+        DURACION_VIDEO_SEGUNDOS,
+        BITRATE_VIDEO_BITS_SEGUNDO
     );
 
     if (!grabador.inicializar())
@@ -1031,9 +1137,6 @@ int main(int argc, char* argv[])
 
     cv::Mat frame;
 
-    /*
-     * Algunas webcams necesitan varios intentos al iniciar.
-     */
     bool primerFrameLeido = false;
 
     for (
@@ -1048,6 +1151,7 @@ int main(int argc, char* argv[])
         )
         {
             primerFrameLeido = true;
+
             break;
         }
 
@@ -1085,6 +1189,13 @@ int main(int argc, char* argv[])
             FPS_CAMARA_DESEADO;
     }
 
+    fpsCamara =
+        std::clamp(
+            fpsCamara,
+            5.0,
+            60.0
+        );
+
     std::cout
         << '\n'
         << "============================================="
@@ -1120,6 +1231,16 @@ int main(int argc, char* argv[])
         << DURACION_VIDEO_SEGUNDOS
         << " segundos"
         << '\n'
+        << "Calidad JPEG:             "
+        << CALIDAD_JPEG
+        << "%"
+        << '\n'
+        << "Bitrate MP4:              "
+        << BITRATE_VIDEO_BITS_SEGUNDO
+        << " bits/s"
+        << '\n'
+        << "Evidencias en disco:      NO"
+        << '\n'
         << "Modelo:                   "
         << rutaModelo
         << '\n'
@@ -1151,16 +1272,8 @@ int main(int argc, char* argv[])
     int deteccionesPositivasConsecutivas = 0;
     int resultadosVaciosConsecutivos = 0;
 
-    /*
-     * Conserva el mejor score obtenido durante todas las
-     * detecciones positivas usadas para confirmar un evento.
-     */
     float mejorScoreConfirmacion = 0.0F;
 
-    /*
-     * Guarda el momento de la detección positiva más reciente.
-     * Se usa para evitar que el mismo taxi genere varios eventos.
-     */
     auto ultimaDeteccionPositiva =
         std::chrono::steady_clock::now();
 
@@ -1235,7 +1348,9 @@ int main(int argc, char* argv[])
             }
 
             frame =
-                frameReconectado;
+                std::move(
+                    frameReconectado
+                );
 
             lecturasFallidasConsecutivas = 0;
         }
@@ -1248,8 +1363,8 @@ int main(int argc, char* argv[])
         ++framesParaFPS;
 
         /*
-         * Recoger el resultado de la petición HTTP sin
-         * bloquear la interfaz.
+         * Recuperar el resultado HTTP sin bloquear
+         * la interfaz de cámara.
          */
         if (envioApiEnCurso)
         {
@@ -1309,7 +1424,7 @@ int main(int argc, char* argv[])
         }
 
         /*
-         * Recoger el resultado del detector.
+         * Recuperar el resultado de la detección asíncrona.
          */
         if (deteccionEnCurso)
         {
@@ -1369,9 +1484,14 @@ int main(int argc, char* argv[])
                     if (!eventoActivo)
                     {
                         const float mejorScore =
-                            obtenerMejorScore(ultimasDetecciones);
+                            obtenerMejorScore(
+                                ultimasDetecciones
+                            );
 
-                        if (mejorScore >= SCORE_MINIMO_PARA_EVENTO)
+                        if (
+                            mejorScore
+                            >= SCORE_MINIMO_PARA_EVENTO
+                        )
                         {
                             ++deteccionesPositivasConsecutivas;
 
@@ -1414,13 +1534,20 @@ int main(int argc, char* argv[])
                         )
                         {
                             deteccionesPositivasConsecutivas = 0;
+                            resultadosVaciosConsecutivos = 0;
+
                             eventoActivo = true;
+
                             ++totalEventos;
 
                             eventoActual.limpiar();
-                            eventoActual.fechaHora = generarFechaHoraEvento();
+
+                            eventoActual.fechaHora =
+                                generarFechaHoraEvento();
+
                             eventoActual.scoreSvm =
                                 mejorScoreConfirmacion;
+
                             eventoActual.confianzaNormalizada =
                                 ClienteAPI::normalizarScoreSVM(
                                     eventoActual.scoreSvm
@@ -1428,7 +1555,11 @@ int main(int argc, char* argv[])
 
                             std::cout
                                 << '\n'
+                                << "============================================="
+                                << '\n'
                                 << "NUEVO EVENTO DE TAXI DETECTADO"
+                                << '\n'
+                                << "============================================="
                                 << '\n'
                                 << "Evento número: "
                                 << totalEventos
@@ -1440,36 +1571,55 @@ int main(int argc, char* argv[])
                                 << eventoActual.confianzaNormalizada
                                 << '\n';
 
-                            const std::string rutaCaptura =
-                                capturador.guardarCaptura(
+                            /*
+                             * La captura se codifica como JPEG y
+                             * permanece dentro del vector.
+                             */
+                            eventoActual.imagenJpeg =
+                                capturador.capturarEnMemoria(
                                     frameAsociadoDeteccion,
                                     ultimasDetecciones
                                 );
 
-                            if (rutaCaptura.empty())
+                            if (eventoActual.imagenJpeg.empty())
                             {
                                 std::cerr
-                                    << "No se pudo guardar la captura del evento."
+                                    << "No se pudo generar la "
+                                    << "captura JPEG en RAM."
                                     << '\n';
                             }
                             else
                             {
-                                eventoActual.rutaImagen = rutaCaptura;
+                                std::cout
+                                    << "Imagen JPEG en RAM: "
+                                    << eventoActual.imagenJpeg.size()
+                                    << " bytes ("
+                                    << std::fixed
+                                    << std::setprecision(2)
+                                    << convertirBytesAMegabytes(
+                                           eventoActual.imagenJpeg.size()
+                                       )
+                                    << " MB)"
+                                    << '\n';
                             }
 
                             const bool videoIniciado =
-                                grabador.iniciar(frame.size(), fpsCamara);
+                                grabador.iniciar(
+                                    frame.size(),
+                                    fpsCamara
+                                );
 
                             if (!videoIniciado)
                             {
                                 std::cerr
-                                    << "No se pudo iniciar el video del evento."
+                                    << "No se pudo iniciar "
+                                    << "el video MP4 en RAM."
                                     << '\n';
                             }
 
                             eventoActual.pendienteEnvio =
                                 apiConfigurada
-                                && !eventoActual.rutaImagen.empty()
+                                && !eventoActual.imagenJpeg.empty()
                                 && videoIniciado;
 
                             mejorScoreConfirmacion = 0.0F;
@@ -1509,13 +1659,8 @@ int main(int argc, char* argv[])
         }
 
         /*
-         * Iniciar otra detección solamente si el detector
-         * está libre.
-         *
-         * Se realiza una sola copia profunda del frame.
-         * El cv::Mat capturado por la tarea comparte esa memoria
-         * mediante conteo de referencias y permanece válido hasta
-         * que la detección finaliza.
+         * Iniciar una nueva detección solamente cuando el
+         * detector se encuentre disponible.
          */
         if (
             !deteccionEnCurso
@@ -1549,11 +1694,6 @@ int main(int argc, char* argv[])
                 );
         }
 
-        /*
-         * Esta copia es necesaria porque sobre frameSalida se
-         * dibujan cajas y paneles sin alterar el frame original
-         * capturado por la cámara.
-         */
         cv::Mat frameSalida =
             frame.clone();
 
@@ -1563,8 +1703,8 @@ int main(int argc, char* argv[])
         );
 
         /*
-         * El video registra los frames mostrados, incluyendo
-         * las cajas de detección.
+         * Los frames mostrados se codifican dentro del MP4
+         * mantenido por GrabadorVideo en memoria RAM.
          */
         if (grabador.estaGrabando())
         {
@@ -1579,14 +1719,15 @@ int main(int argc, char* argv[])
             )
             {
                 std::cerr
-                    << "No se pudo escribir un frame del video."
+                    << "No se pudo codificar "
+                    << "un frame del video."
                     << '\n';
             }
         }
 
         /*
-         * Cuando GrabadorVideo finaliza automáticamente,
-         * recuperamos la ruta y enviamos el evento.
+         * Al completarse el video, se mueve el vector MP4
+         * desde GrabadorVideo hacia el evento.
          */
         if (
             eventoActual.pendienteEnvio
@@ -1595,29 +1736,53 @@ int main(int argc, char* argv[])
             && !envioApiEnCurso
         )
         {
-            eventoActual.rutaVideo =
-                grabador.obtenerUltimoVideoGuardado();
+            eventoActual.videoMp4 =
+                grabador.extraerVideoEnMemoria();
 
             if (
-                eventoActual.rutaVideo.empty()
-                || eventoActual.rutaImagen.empty()
+                eventoActual.videoMp4.empty()
+                || eventoActual.imagenJpeg.empty()
             )
             {
                 std::cerr
-                    << "El evento no contiene ambas evidencias."
+                    << "El evento no contiene ambas "
+                    << "evidencias en memoria RAM."
                     << '\n';
 
                 eventoActual.pendienteEnvio = false;
             }
             else
             {
+                std::cout
+                    << '\n'
+                    << "EVIDENCIAS PREPARADAS EN RAM"
+                    << '\n'
+                    << "Imagen: "
+                    << eventoActual.imagenJpeg.size()
+                    << " bytes"
+                    << '\n'
+                    << "Video: "
+                    << eventoActual.videoMp4.size()
+                    << " bytes"
+                    << '\n';
+
                 DatosEventoTaxi datosEnvio;
 
-                datosEnvio.rutaImagen =
-                    eventoActual.rutaImagen;
+                datosEnvio.imagenDatos =
+                    std::move(
+                        eventoActual.imagenJpeg
+                    );
 
-                datosEnvio.rutaVideo =
-                    eventoActual.rutaVideo;
+                datosEnvio.videoDatos =
+                    std::move(
+                        eventoActual.videoMp4
+                    );
+
+                datosEnvio.nombreImagen =
+                    "captura_taxi.jpg";
+
+                datosEnvio.nombreVideo =
+                    "evidencia_taxi.mp4";
 
                 datosEnvio.vehiculo =
                     "Taxi amarillo";
@@ -1641,10 +1806,19 @@ int main(int argc, char* argv[])
                 estadoApi =
                     "ENVIANDO";
 
+                /*
+                 * La tarea asíncrona toma posesión de los
+                 * vectores y los conserva durante toda la
+                 * petición HTTP.
+                 */
                 tareaEnvioApi =
                     std::async(
                         std::launch::async,
-                        [&clienteApi, datosEnvio]()
+                        [
+                            &clienteApi,
+                            datosEnvio =
+                                std::move(datosEnvio)
+                        ]() mutable
                         {
                             return clienteApi.enviarEvento(
                                 datosEnvio
@@ -1672,8 +1846,10 @@ int main(int argc, char* argv[])
         )
         {
             eventoActivo = false;
+
             deteccionesPositivasConsecutivas = 0;
             resultadosVaciosConsecutivos = 0;
+
             mejorScoreConfirmacion = 0.0F;
 
             ultimasDetecciones.clear();
@@ -1692,6 +1868,7 @@ int main(int argc, char* argv[])
                 << "Sistema listo para detectar un nuevo taxi."
                 << '\n';
         }
+
         const auto ahora =
             std::chrono::steady_clock::now();
 
@@ -1705,11 +1882,9 @@ int main(int argc, char* argv[])
             fpsAplicacion =
                 static_cast<double>(
                     framesParaFPS
-                ) /
-                segundosFPS;
+                ) / segundosFPS;
 
             framesParaFPS = 0;
-
             tiempoFPS = ahora;
 
             memoriaRAM =
@@ -1754,13 +1929,102 @@ int main(int argc, char* argv[])
         }
     }
 
+    /*
+     * Completar correctamente cualquier video activo.
+     */
     if (grabador.estaGrabando())
     {
         std::cout
-            << "Finalizando grabación en curso..."
+            << "Finalizando grabación en RAM..."
             << '\n';
 
-        grabador.finalizar();
+        if (!grabador.finalizar())
+        {
+            std::cerr
+                << "No se pudo finalizar el video MP4."
+                << '\n';
+        }
+    }
+
+    /*
+     * Si el usuario cerró justo cuando terminó el video,
+     * realizar el último envío antes de salir.
+     */
+    if (
+        eventoActual.pendienteEnvio
+        && grabador.grabacionCompletada()
+        && !envioApiEnCurso
+    )
+    {
+        eventoActual.videoMp4 =
+            grabador.extraerVideoEnMemoria();
+
+        if (
+            !eventoActual.imagenJpeg.empty()
+            && !eventoActual.videoMp4.empty()
+        )
+        {
+            DatosEventoTaxi datosEnvio;
+
+            datosEnvio.imagenDatos =
+                std::move(
+                    eventoActual.imagenJpeg
+                );
+
+            datosEnvio.videoDatos =
+                std::move(
+                    eventoActual.videoMp4
+                );
+
+            datosEnvio.nombreImagen =
+                "captura_taxi.jpg";
+
+            datosEnvio.nombreVideo =
+                "evidencia_taxi.mp4";
+
+            datosEnvio.vehiculo =
+                "Taxi amarillo";
+
+            datosEnvio.camara =
+                "Cámara "
+                + std::to_string(
+                      indiceCamara
+                  );
+
+            datosEnvio.fechaHora =
+                eventoActual.fechaHora;
+
+            datosEnvio.confianzaCpp =
+                eventoActual.confianzaNormalizada;
+
+            std::cout
+                << "Enviando el último evento pendiente..."
+                << '\n';
+
+            const RespuestaAPI respuesta =
+                clienteApi.enviarEvento(
+                    datosEnvio
+                );
+
+            ultimaLatenciaApi =
+                respuesta.latenciaMilisegundos;
+
+            if (respuesta.exitoso)
+            {
+                ++totalEnviosExitosos;
+            }
+            else
+            {
+                ++totalEnviosFallidos;
+
+                std::cerr
+                    << "El último envío no fue exitoso: "
+                    << respuesta.mensajeError
+                    << '\n';
+            }
+
+            eventoActual.pendienteEnvio = false;
+        }
     }
 
     if (deteccionEnCurso)
@@ -1771,7 +2035,7 @@ int main(int argc, char* argv[])
 
         try
         {
-            tareaDeteccion.get();
+            (void)tareaDeteccion.get();
         }
         catch (const std::exception& error)
         {
@@ -1825,8 +2089,11 @@ int main(int argc, char* argv[])
 
     cv::destroyAllWindows();
 
+    eventoActual.limpiar();
+
     std::cout
-        << '\n'<< "============================================="
+        << '\n'
+        << "============================================="
         << '\n'
         << "RESUMEN DE LA EJECUCION"
         << '\n'
@@ -1835,10 +2102,10 @@ int main(int argc, char* argv[])
         << "Eventos detectados:       "
         << totalEventos
         << '\n'
-        << "Capturas guardadas:       "
+        << "Capturas generadas RAM:   "
         << capturador.obtenerTotalCapturas()
         << '\n'
-        << "Videos guardados:         "
+        << "Videos generados RAM:     "
         << grabador.obtenerTotalVideos()
         << '\n'
         << "Envíos exitosos:          "
@@ -1856,6 +2123,8 @@ int main(int argc, char* argv[])
         << "Memoria RAM final:        "
         << obtenerMemoriaRAMMegabytes()
         << " MB"
+        << '\n'
+        << "Archivos de evidencia:    0"
         << '\n'
         << "============================================="
         << '\n'

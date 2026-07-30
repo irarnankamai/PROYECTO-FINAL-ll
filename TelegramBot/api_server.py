@@ -6,8 +6,9 @@ import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import (
@@ -25,8 +26,6 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from config import (
-    YOLO_FILTER_ONLY_TARGET,
-    YOLO_TARGET_CLASS,
     API_HOST,
     API_KEY,
     API_MAX_IMAGE_MB,
@@ -40,15 +39,17 @@ from config import (
     VIDEO_MAX_SIDE,
     YOLO_CONFIDENCE,
     YOLO_DEVICE,
+    YOLO_FILTER_ONLY_TARGET,
     YOLO_IMAGE_SIZE,
     YOLO_MODEL,
+    YOLO_TARGET_CLASS,
 )
 from video_processor import YOLOVideoProcessor
 from yolo_processor import YOLOSegmenter
 
 
 # =========================================================
-# LOGS
+# CONFIGURACIÓN DE LOGS
 # =========================================================
 
 logging.basicConfig(
@@ -65,34 +66,11 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# RUTAS
+# CONSTANTES
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
-API_INPUT_IMAGES_DIR = (
-    BASE_DIR / "input" / "api" / "images"
-)
-
-API_INPUT_VIDEOS_DIR = (
-    BASE_DIR / "input" / "api" / "videos"
-)
-
-API_OUTPUT_IMAGES_DIR = (
-    BASE_DIR / "output" / "api" / "images"
-)
-
-API_OUTPUT_VIDEOS_DIR = (
-    BASE_DIR / "output" / "api" / "videos"
-)
-
-
-# La API pública de Telegram admite hasta 50 MB
-# cuando el bot sube un video directamente.
 MAX_TELEGRAM_UPLOAD_BYTES = 49 * 1024 * 1024
-
 CHUNK_SIZE = 1024 * 1024
-
 
 SUPPORTED_IMAGE_EXTENSIONS = {
     ".jpg",
@@ -113,22 +91,26 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 
 
 # =========================================================
-# INFORMACIÓN DE UN EVENTO
+# INFORMACIÓN DEL EVENTO
 # =========================================================
 
 @dataclass(frozen=True)
 class TrafficEvent:
+    """
+    Contiene toda la información del evento en memoria RAM.
+    """
+
     event_id: str
     vehicle: str
     cpp_confidence: float
     camera: str
     event_datetime: str
 
-    input_image_path: Path
-    input_video_path: Path
+    image_data: bytes
+    video_data: bytes
 
-    segmented_image_path: Path
-    segmented_video_path: Path
+    image_filename: str
+    video_filename: str
 
 
 # =========================================================
@@ -136,6 +118,10 @@ class TrafficEvent:
 # =========================================================
 
 def create_event_id() -> str:
+    """
+    Genera un identificador único para el evento.
+    """
+
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
     )
@@ -150,9 +136,14 @@ def obtain_extension(
     permitted_extensions: set[str],
     default_extension: str,
 ) -> str:
+    """
+    Obtiene una extensión válida del archivo recibido.
+    """
 
     if file_name:
-        extension = Path(file_name).suffix.lower()
+        extension = Path(
+            file_name
+        ).suffix.lower()
 
         if extension in permitted_extensions:
             return extension
@@ -160,20 +151,47 @@ def obtain_extension(
     return default_extension
 
 
+def sanitize_filename(
+    file_name: str | None,
+    default_name: str,
+) -> str:
+    """
+    Elimina cualquier ruta incluida en el nombre recibido.
+    """
+
+    if not file_name:
+        return default_name
+
+    clean_name = Path(
+        file_name
+    ).name.strip()
+
+    return clean_name or default_name
+
+
 def shorten_text(
     text: str,
     maximum_length: int = 250,
 ) -> str:
+    """
+    Reduce un texto para evitar mensajes demasiado largos.
+    """
 
     if len(text) <= maximum_length:
         return text
 
-    return text[: maximum_length - 3] + "..."
+    return (
+        text[: maximum_length - 3]
+        + "..."
+    )
 
 
 def validate_api_key(
     received_key: str | None,
 ) -> None:
+    """
+    Verifica la API Key enviada por la aplicación C++.
+    """
 
     if not API_KEY:
         raise RuntimeError(
@@ -187,116 +205,161 @@ def validate_api_key(
 
     if not valid:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=(
+                status.HTTP_401_UNAUTHORIZED
+            ),
             detail="API Key inválida.",
         )
 
 
-async def save_uploaded_file(
+async def read_uploaded_file_in_memory(
     upload: UploadFile,
-    destination: Path,
     maximum_bytes: int,
-) -> int:
+    file_description: str,
+) -> bytes:
     """
-    Guarda el archivo por bloques para no cargarlo
-    completamente en memoria RAM.
+    Lee un archivo recibido por FastAPI directamente
+    en memoria RAM.
+
+    El archivo se lee por bloques para comprobar que
+    no supere el tamaño máximo configurado.
     """
 
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    data = bytearray()
     total_bytes = 0
 
     try:
-        with destination.open("wb") as output_file:
+        while True:
+            chunk = await upload.read(
+                CHUNK_SIZE
+            )
 
-            while True:
-                chunk = await upload.read(
-                    CHUNK_SIZE
+            if not chunk:
+                break
+
+            total_bytes += len(
+                chunk
+            )
+
+            if total_bytes > maximum_bytes:
+                raise HTTPException(
+                    status_code=(
+                        status
+                        .HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                    ),
+                    detail=(
+                        f"El archivo de {file_description} "
+                        "supera el tamaño permitido."
+                    ),
                 )
 
-                if not chunk:
-                    break
-
-                total_bytes += len(chunk)
-
-                if total_bytes > maximum_bytes:
-                    raise HTTPException(
-                        status_code=(
-                                   status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
-                                 ),
-                        detail=(
-                            f"El archivo {upload.filename} "
-                            "supera el tamaño permitido."
-                        ),
-                    )
-
-                output_file.write(chunk)
-
-    except Exception:
-        destination.unlink(
-            missing_ok=True
-        )
-        raise
+            data.extend(
+                chunk
+            )
 
     finally:
         await upload.close()
 
     if total_bytes == 0:
-        destination.unlink(
-            missing_ok=True
-        )
-
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=(
+                status.HTTP_400_BAD_REQUEST
+            ),
             detail=(
-                f"El archivo {upload.filename} "
+                f"El archivo de {file_description} "
                 "está vacío."
             ),
         )
 
-    return total_bytes
+    return bytes(
+        data
+    )
 
+
+def create_telegram_buffer(
+    data: bytes,
+    filename: str,
+) -> BytesIO:
+    """
+    Crea un archivo virtual en RAM compatible
+    con Telegram.
+    """
+
+    if not data:
+        raise ValueError(
+            f"El archivo {filename} está vacío."
+        )
+
+    buffer = BytesIO(
+        data
+    )
+
+    buffer.name = filename
+    buffer.seek(0)
+
+    return buffer
+
+
+# =========================================================
+# CREACIÓN DE MENSAJES
+# =========================================================
 
 def build_image_caption(
-    metrics: dict,
+    metrics: dict[str, Any],
     event: TrafficEvent,
 ) -> str:
+    """
+    Construye el mensaje de la imagen segmentada.
+    """
 
     classes = shorten_text(
-        metrics["classes_summary"]
+        str(
+            metrics.get(
+                "classes_summary",
+                "Sin información",
+            )
+        )
     )
 
     return (
         "🧠 SEGMENTACIÓN DE IMAGEN YOLO\n\n"
         f"Evento: {event.event_id}\n"
         f"Vehículo objetivo: {event.vehicle}\n"
-        f"Modelo: {metrics['model']}\n"
-        f"Dispositivo: {metrics['device']}\n\n"
+        f"Modelo: "
+        f"{metrics.get('model', YOLO_MODEL)}\n"
+        f"Dispositivo: "
+        f"{metrics.get('device', YOLO_DEVICE)}\n\n"
         f"Objetos detectados: "
-        f"{metrics['detections']}\n"
-        f"Máscaras: {metrics['masks']}\n"
+        f"{metrics.get('detections', 0)}\n"
+        f"Máscaras: "
+        f"{metrics.get('masks', 0)}\n"
         f"Confianza promedio: "
-        f"{metrics['confidence_average'] * 100:.2f} %\n"
+        f"{float(metrics.get('confidence_average', 0.0)) * 100:.2f} %\n"
         f"Confianza máxima: "
-        f"{metrics['confidence_maximum'] * 100:.2f} %\n"
+        f"{float(metrics.get('confidence_maximum', 0.0)) * 100:.2f} %\n"
         f"FPS de inferencia: "
-        f"{metrics['inference_fps']:.2f}\n"
+        f"{float(metrics.get('inference_fps', 0.0)):.2f}\n"
         f"RAM del proceso: "
-        f"{metrics['ram_after_mb']:.2f} MB\n\n"
+        f"{float(metrics.get('ram_after_mb', 0.0)):.2f} MB\n\n"
         f"Clases: {classes}"
     )
 
 
 def build_video_caption(
-    metrics: dict,
+    metrics: dict[str, Any],
     event: TrafficEvent,
 ) -> str:
+    """
+    Construye el mensaje del video segmentado.
+    """
 
     classes = shorten_text(
-        metrics["classes_summary"]
+        str(
+            metrics.get(
+                "classes_summary",
+                "Sin información",
+            )
+        )
     )
 
     return (
@@ -304,31 +367,197 @@ def build_video_caption(
         f"Evento: {event.event_id}\n"
         f"Vehículo objetivo: {event.vehicle}\n"
         f"Duración: "
-        f"{metrics['clip_duration_seconds']:.2f} s\n"
+        f"{float(metrics.get('clip_duration_seconds', 0.0)):.2f} s\n"
         f"Frames procesados: "
-        f"{metrics['frames_processed']}\n"
+        f"{metrics.get('frames_processed', 0)}\n"
         f"FPS de procesamiento: "
-        f"{metrics['processing_fps']:.2f}\n"
+        f"{float(metrics.get('processing_fps', 0.0)):.2f}\n"
         f"FPS equivalente de inferencia: "
-        f"{metrics['inference_fps']:.2f}\n"
+        f"{float(metrics.get('inference_fps', 0.0)):.2f}\n"
         f"Confianza promedio: "
-        f"{metrics['confidence_average'] * 100:.2f} %\n"
+        f"{float(metrics.get('confidence_average', 0.0)) * 100:.2f} %\n"
         f"Confianza máxima: "
-        f"{metrics['confidence_maximum'] * 100:.2f} %\n"
+        f"{float(metrics.get('confidence_maximum', 0.0)) * 100:.2f} %\n"
         f"RAM máxima: "
-        f"{metrics['ram_peak_mb']:.2f} MB\n\n"
+        f"{float(metrics.get('ram_peak_mb', 0.0)):.2f} MB\n\n"
         f"Clases: {classes}"
     )
 
 
 # =========================================================
-# PROCESAR EVENTO Y ENVIAR A TELEGRAM
+# ENVÍO DE IMAGEN A TELEGRAM
+# =========================================================
+
+async def send_photo_from_memory(
+    telegram_bot: Bot,
+    image_data: bytes,
+    filename: str,
+    caption: str,
+) -> None:
+    """
+    Envía una imagen almacenada en RAM a Telegram.
+    """
+
+    image_buffer = create_telegram_buffer(
+        image_data,
+        filename,
+    )
+
+    try:
+        await telegram_bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=image_buffer,
+            caption=caption,
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
+        )
+
+    finally:
+        image_buffer.close()
+
+
+# =========================================================
+# ENVÍO DE VIDEO A TELEGRAM
+# =========================================================
+
+async def send_video_from_memory(
+    telegram_bot: Bot,
+    video_data: bytes,
+    video_metrics: dict[str, Any],
+    caption: str,
+) -> None:
+    """
+    Intenta enviar el resultado como video.
+
+    Si Telegram rechaza el video, lo vuelve a enviar
+    como documento MP4.
+    """
+
+    if not video_data:
+        raise ValueError(
+            "El video segmentado está vacío."
+        )
+
+    if (
+        len(video_data)
+        > MAX_TELEGRAM_UPLOAD_BYTES
+    ):
+        raise RuntimeError(
+            "El video segmentado supera 49 MB. "
+            "Reduce VIDEO_MAX_SIDE o "
+            "VIDEO_MAX_OUTPUT_FPS."
+        )
+
+    duration = int(
+        round(
+            float(
+                video_metrics.get(
+                    "clip_duration_seconds",
+                    VIDEO_CLIP_SECONDS,
+                )
+            )
+        )
+    )
+
+    width = int(
+        video_metrics.get(
+            "output_width",
+            0,
+        )
+    )
+
+    height = int(
+        video_metrics.get(
+            "output_height",
+            0,
+        )
+    )
+
+    video_buffer = create_telegram_buffer(
+        video_data,
+        "video_segmentado.mp4",
+    )
+
+    try:
+        await telegram_bot.send_video(
+            chat_id=CHAT_ID,
+            video=video_buffer,
+            caption=caption,
+            duration=max(
+                1,
+                duration,
+            ),
+            width=max(
+                1,
+                width,
+            ),
+            height=max(
+                1,
+                height,
+            ),
+            supports_streaming=True,
+            connect_timeout=30,
+            read_timeout=180,
+            write_timeout=180,
+        )
+
+    except TelegramError as video_error:
+        logger.warning(
+            "No se pudo enviar el resultado como video: %s. "
+            "Se intentará enviar como documento.",
+            video_error,
+        )
+
+        if not video_buffer.closed:
+            video_buffer.close()
+
+        document_buffer = create_telegram_buffer(
+            video_data,
+            "video_segmentado.mp4",
+        )
+
+        try:
+            await telegram_bot.send_document(
+                chat_id=CHAT_ID,
+                document=document_buffer,
+                caption=(
+                    caption
+                    + "\n\n"
+                    "⚠️ Resultado enviado como "
+                    "archivo MP4."
+                ),
+                connect_timeout=30,
+                read_timeout=180,
+                write_timeout=180,
+            )
+
+        finally:
+            document_buffer.close()
+
+    finally:
+        if not video_buffer.closed:
+            video_buffer.close()
+
+
+# =========================================================
+# PROCESAMIENTO DEL EVENTO
 # =========================================================
 
 async def process_traffic_event(
     app: FastAPI,
     event: TrafficEvent,
 ) -> None:
+    """
+    Procesa la imagen y el video completamente en RAM.
+
+    Flujo:
+        1. Envía el mensaje de alerta.
+        2. Envía la imagen original.
+        3. Segmenta la imagen con YOLO.
+        4. Segmenta el video con YOLO.
+        5. Envía los resultados a Telegram.
+    """
 
     telegram_bot: Bot = (
         app.state.telegram_bot
@@ -348,7 +577,7 @@ async def process_traffic_event(
 
     try:
         logger.info(
-            "Procesando evento %s",
+            "Procesando evento %s completamente en RAM.",
             event.event_id,
         )
 
@@ -370,179 +599,150 @@ async def process_traffic_event(
         await telegram_bot.send_message(
             chat_id=CHAT_ID,
             text=alert_text,
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
         )
 
         # =================================================
         # 2. IMAGEN ORIGINAL
         # =================================================
 
-        with event.input_image_path.open(
-            "rb"
-        ) as original_image:
-
-            await telegram_bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=original_image,
-                caption=(
-                    "📸 Imagen original del evento.\n\n"
-                    f"Vehículo objetivo: "
-                    f"{event.vehicle}\n"
-                    f"Evento: {event.event_id}"
-                ),
-                write_timeout=120,
-            )
+        await send_photo_from_memory(
+            telegram_bot=telegram_bot,
+            image_data=event.image_data,
+            filename=event.image_filename,
+            caption=(
+                "📸 Imagen original del evento.\n\n"
+                f"Vehículo objetivo: "
+                f"{event.vehicle}\n"
+                f"Evento: {event.event_id}"
+            ),
+        )
 
         # =================================================
-        # 3. SEGMENTAR IMAGEN
+        # 3. SEGMENTAR IMAGEN EN RAM
         # =================================================
 
         async with yolo_lock:
-            image_metrics = await asyncio.to_thread(
+            (
+                segmented_image_data,
+                image_metrics,
+            ) = await asyncio.to_thread(
                 segmenter.process_image,
-                event.input_image_path,
-                event.segmented_image_path,
+                event.image_data,
             )
 
-        with event.segmented_image_path.open(
-            "rb"
-        ) as segmented_image:
-
-            await telegram_bot.send_photo(
-                chat_id=CHAT_ID,
-                photo=segmented_image,
-                caption=build_image_caption(
-                    image_metrics,
-                    event,
-                ),
-                write_timeout=120,
+        if not segmented_image_data:
+            raise RuntimeError(
+                "YOLO generó una imagen segmentada vacía."
             )
+
+        await send_photo_from_memory(
+            telegram_bot=telegram_bot,
+            image_data=segmented_image_data,
+            filename="imagen_segmentada.jpg",
+            caption=build_image_caption(
+                image_metrics,
+                event,
+            ),
+        )
 
         # =================================================
-        # 4. SEGMENTAR VIDEO
+        # 4. SEGMENTAR VIDEO EN RAM
         # =================================================
 
         async with yolo_lock:
-            video_metrics = await asyncio.to_thread(
+            (
+                segmented_video_data,
+                video_metrics,
+            ) = await asyncio.to_thread(
                 video_processor.process_video,
-                event.input_video_path,
-                event.segmented_video_path,
+                event.video_data,
             )
 
-        output_size = (
-            event.segmented_video_path.stat().st_size
-        )
-
-        if output_size > MAX_TELEGRAM_UPLOAD_BYTES:
+        if not segmented_video_data:
             raise RuntimeError(
-                "El video segmentado supera 49 MB. "
-                "Reduce VIDEO_MAX_SIDE o "
-                "VIDEO_MAX_OUTPUT_FPS."
+                "YOLO generó un video segmentado vacío."
             )
 
-        video_caption = build_video_caption(
-            video_metrics,
-            event,
+        # =================================================
+        # 5. ENVIAR VIDEO SEGMENTADO
+        # =================================================
+
+        await send_video_from_memory(
+            telegram_bot=telegram_bot,
+            video_data=segmented_video_data,
+            video_metrics=video_metrics,
+            caption=build_video_caption(
+                video_metrics,
+                event,
+            ),
         )
 
         # =================================================
-        # 5. ENVIAR VIDEO
+        # 6. MENSAJE FINAL
         # =================================================
-
-        try:
-            with event.segmented_video_path.open(
-                "rb"
-            ) as segmented_video:
-
-                await telegram_bot.send_video(
-                    chat_id=CHAT_ID,
-                    video=segmented_video,
-                    caption=video_caption,
-                    duration=int(
-                        round(
-                            video_metrics[
-                                "clip_duration_seconds"
-                            ]
-                        )
-                    ),
-                    width=int(
-                        video_metrics["output_width"]
-                    ),
-                    height=int(
-                        video_metrics["output_height"]
-                    ),
-                    supports_streaming=True,
-                    connect_timeout=30,
-                    read_timeout=180,
-                    write_timeout=180,
-                )
-
-        except TelegramError as video_error:
-            logger.warning(
-                "No se pudo enviar como video: %s. "
-                "Se intentará como documento.",
-                video_error,
-            )
-
-            with event.segmented_video_path.open(
-                "rb"
-            ) as segmented_video:
-
-                await telegram_bot.send_document(
-                    chat_id=CHAT_ID,
-                    document=segmented_video,
-                    caption=(
-                        video_caption
-                        + "\n\n"
-                        "⚠️ Resultado enviado como "
-                        "archivo MP4."
-                    ),
-                    connect_timeout=30,
-                    read_timeout=180,
-                    write_timeout=180,
-                )
 
         await telegram_bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 "✅ Evento procesado completamente.\n\n"
-                f"Evento: {event.event_id}"
+                f"Evento: {event.event_id}\n"
+                "Procesamiento: memoria RAM"
             ),
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
         )
 
         logger.info(
-            "Evento %s terminado correctamente.",
+            "Evento %s procesado correctamente en RAM.",
             event.event_id,
         )
 
     except Exception as error:
         logger.exception(
-            "Error procesando evento %s",
+            "Error procesando el evento %s.",
             event.event_id,
         )
 
         try:
+            error_detail = shorten_text(
+                str(error),
+                maximum_length=500,
+            )
+
             await telegram_bot.send_message(
                 chat_id=CHAT_ID,
                 text=(
                     "❌ Error procesando una alerta.\n\n"
                     f"Evento: {event.event_id}\n"
-                    f"Detalle: {error}"
+                    f"Detalle: {error_detail}"
                 ),
+                connect_timeout=30,
+                read_timeout=120,
+                write_timeout=120,
             )
 
         except Exception:
             logger.exception(
                 "Tampoco se pudo informar "
-                "el error por Telegram."
+                "el error mediante Telegram."
             )
 
 
 # =========================================================
-# CICLO DE VIDA DE LA API
+# CICLO DE VIDA DE FASTAPI
 # =========================================================
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(
+    app: FastAPI,
+):
+    """
+    Carga YOLO y Telegram una sola vez al iniciar la API.
+    """
 
     if not TOKEN:
         raise RuntimeError(
@@ -554,25 +754,10 @@ async def lifespan(app: FastAPI):
             "CHAT_ID no está configurado."
         )
 
-    API_INPUT_IMAGES_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    API_INPUT_VIDEOS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    API_OUTPUT_IMAGES_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    API_OUTPUT_VIDEOS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not API_KEY:
+        raise RuntimeError(
+            "API_KEY no está configurada."
+        )
 
     print()
     print("=" * 65)
@@ -585,14 +770,18 @@ async def lifespan(app: FastAPI):
         device=YOLO_DEVICE,
         image_size=YOLO_IMAGE_SIZE,
         target_class_name=YOLO_TARGET_CLASS,
-        filter_only_target=YOLO_FILTER_ONLY_TARGET,
+        filter_only_target=(
+            YOLO_FILTER_ONLY_TARGET
+        ),
     )
 
     video_processor = YOLOVideoProcessor(
         segmenter=segmenter,
         clip_seconds=VIDEO_CLIP_SECONDS,
         max_side=VIDEO_MAX_SIDE,
-        max_output_fps=VIDEO_MAX_OUTPUT_FPS,
+        max_output_fps=(
+            VIDEO_MAX_OUTPUT_FPS
+        ),
     )
 
     telegram_bot = Bot(
@@ -607,11 +796,14 @@ async def lifespan(app: FastAPI):
     )
     app.state.telegram_bot = telegram_bot
 
-    # Impide que dos eventos utilicen el mismo
-    # modelo YOLO simultáneamente.
+    # Evita que dos eventos utilicen el mismo
+    # modelo YOLO al mismo tiempo.
     app.state.yolo_lock = asyncio.Lock()
 
     print("Servicio cargado correctamente.")
+    print("Procesamiento de imagen: RAM")
+    print("Procesamiento de video : RAM")
+    print("Almacenamiento permanente: desactivado")
     print("=" * 65)
     print()
 
@@ -621,14 +813,23 @@ async def lifespan(app: FastAPI):
     finally:
         await telegram_bot.shutdown()
 
+        logger.info(
+            "Servicio YOLO + Telegram finalizado."
+        )
+
 
 # =========================================================
-# CREAR APLICACIÓN FASTAPI
+# CREACIÓN DE LA APLICACIÓN
 # =========================================================
 
 app = FastAPI(
     title="API de Monitoreo de Tráfico",
-    version="1.0.0",
+    description=(
+        "Recibe evidencias desde C++, procesa imagen "
+        "y video con YOLO en RAM y envía los resultados "
+        "al bot de Telegram."
+    ),
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -638,19 +839,26 @@ app = FastAPI(
 # =========================================================
 
 @app.get("/health")
-async def health() -> dict:
+async def health() -> dict[str, Any]:
+    """
+    Comprueba que la API esté funcionando.
+    """
 
     return {
         "ok": True,
         "service": "YOLO Telegram API",
+        "version": "3.0.0",
         "model": YOLO_MODEL,
         "device": YOLO_DEVICE,
         "target_vehicle": TARGET_VEHICLE,
+        "image_processing": "memory",
+        "video_processing": "memory",
+        "persistent_storage": False,
     }
 
 
 # =========================================================
-# ENDPOINT QUE USARÁ C++
+# ENDPOINT UTILIZADO POR C++
 # =========================================================
 
 @app.post(
@@ -663,12 +871,18 @@ async def receive_traffic_alert(
 
     vehiculo: Annotated[
         str,
-        Form(min_length=2, max_length=100),
+        Form(
+            min_length=2,
+            max_length=100,
+        ),
     ],
 
     confianza_cpp: Annotated[
         float,
-        Form(ge=0.0, le=1.0),
+        Form(
+            ge=0.0,
+            le=1.0,
+        ),
     ],
 
     imagen: Annotated[
@@ -683,7 +897,9 @@ async def receive_traffic_alert(
 
     camara: Annotated[
         str,
-        Form(max_length=100),
+        Form(
+            max_length=100,
+        ),
     ] = "Cámara principal",
 
     fecha_hora: Annotated[
@@ -693,9 +909,15 @@ async def receive_traffic_alert(
 
     x_api_key: Annotated[
         str | None,
-        Header(alias="X-API-Key"),
+        Header(
+            alias="X-API-Key"
+        ),
     ] = None,
-) -> dict:
+) -> dict[str, Any]:
+    """
+    Recibe la imagen, el video y los datos enviados
+    desde la aplicación C++.
+    """
 
     validate_api_key(
         x_api_key
@@ -715,95 +937,102 @@ async def receive_traffic_alert(
         ".mp4",
     )
 
-    input_image_path = (
-        API_INPUT_IMAGES_DIR
-        / f"imagen_{event_id}{image_extension}"
+    image_filename = sanitize_filename(
+        imagen.filename,
+        f"imagen{image_extension}",
     )
 
-    input_video_path = (
-        API_INPUT_VIDEOS_DIR
-        / f"video_{event_id}{video_extension}"
+    video_filename = sanitize_filename(
+        video.filename,
+        f"video{video_extension}",
     )
 
-    segmented_image_path = (
-        API_OUTPUT_IMAGES_DIR
-        / f"imagen_segmentada_{event_id}.jpg"
+    # =====================================================
+    # LEER IMAGEN EN RAM
+    # =====================================================
+
+    image_data = await read_uploaded_file_in_memory(
+        upload=imagen,
+        maximum_bytes=(
+            API_MAX_IMAGE_MB
+            * 1024
+            * 1024
+        ),
+        file_description="imagen",
     )
 
-    segmented_video_path = (
-        API_OUTPUT_VIDEOS_DIR
-        / f"video_segmentado_{event_id}.mp4"
+    # =====================================================
+    # LEER VIDEO EN RAM
+    # =====================================================
+
+    video_data = await read_uploaded_file_in_memory(
+        upload=video,
+        maximum_bytes=(
+            API_MAX_VIDEO_MB
+            * 1024
+            * 1024
+        ),
+        file_description="video",
     )
 
-    try:
-        image_bytes = await save_uploaded_file(
-            upload=imagen,
-            destination=input_image_path,
-            maximum_bytes=(
-                API_MAX_IMAGE_MB
-                * 1024
-                * 1024
-            ),
-        )
+    clean_vehicle = (
+        vehiculo.strip()
+    )
 
-        video_bytes = await save_uploaded_file(
-            upload=video,
-            destination=input_video_path,
-            maximum_bytes=(
-                API_MAX_VIDEO_MB
-                * 1024
-                * 1024
-            ),
-        )
+    clean_camera = (
+        camara.strip()
+        or "Cámara principal"
+    )
 
-    except Exception:
-        input_image_path.unlink(
-            missing_ok=True
+    clean_datetime = (
+        fecha_hora.strip()
+        if (
+            fecha_hora
+            and fecha_hora.strip()
         )
-
-        input_video_path.unlink(
-            missing_ok=True
+        else datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
-
-        raise
+    )
 
     event = TrafficEvent(
         event_id=event_id,
-        vehicle=vehiculo.strip(),
+        vehicle=clean_vehicle,
         cpp_confidence=float(
             confianza_cpp
         ),
-        camera=camara.strip(),
-        event_datetime=(
-            fecha_hora
-            or datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        ),
-        input_image_path=input_image_path,
-        input_video_path=input_video_path,
-        segmented_image_path=(
-            segmented_image_path
-        ),
-        segmented_video_path=(
-            segmented_video_path
-        ),
+        camera=clean_camera,
+        event_datetime=clean_datetime,
+        image_data=image_data,
+        video_data=video_data,
+        image_filename=image_filename,
+        video_filename=video_filename,
     )
 
-    # La respuesta HTTP se devuelve primero.
-    # Después se ejecuta YOLO y Telegram.
+    # La API devuelve primero la respuesta a C++.
+    # Después procesa YOLO y Telegram.
     background_tasks.add_task(
         process_traffic_event,
         request.app,
         event,
     )
 
+    image_mb = (
+        len(image_data)
+        / (1024 * 1024)
+    )
+
+    video_mb = (
+        len(video_data)
+        / (1024 * 1024)
+    )
+
     logger.info(
-        "Alerta %s recibida. Imagen: %.2f MB, "
-        "video: %.2f MB",
+        "Alerta %s recibida en RAM. "
+        "Imagen: %.2f MB. Video: %.2f MB.",
         event_id,
-        image_bytes / (1024 * 1024),
-        video_bytes / (1024 * 1024),
+        image_mb,
+        video_mb,
     )
 
     return {
@@ -811,20 +1040,28 @@ async def receive_traffic_alert(
         "status": "accepted",
         "event_id": event_id,
         "message": (
-            "Imagen y video recibidos. "
-            "El procesamiento continuará "
+            "Imagen y video recibidos correctamente. "
+            "El procesamiento en RAM continuará "
             "en segundo plano."
         ),
         "image_mb": round(
-            image_bytes / (1024 * 1024),
+            image_mb,
             2,
         ),
         "video_mb": round(
-            video_bytes / (1024 * 1024),
+            video_mb,
             2,
         ),
+        "image_filename": (
+            image_filename
+        ),
+        "video_filename": (
+            video_filename
+        ),
+        "processing_mode": "memory",
+        "persistent_storage": False,
     }
-    
+
 
 # =========================================================
 # EJECUCIÓN DIRECTA

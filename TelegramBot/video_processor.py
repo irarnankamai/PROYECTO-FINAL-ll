@@ -4,32 +4,43 @@ import math
 import os
 import time
 from collections import Counter
-from pathlib import Path
+from fractions import Fraction
+from io import BytesIO
 from typing import Any
 
+import av
 import cv2
+import numpy as np
 import psutil
+from numpy.typing import NDArray
 
 from yolo_processor import YOLOSegmenter
 
 
 class YOLOVideoProcessor:
     """
-    Procesa un clip de video cuadro por cuadro utilizando
-    un modelo YOLO de segmentación previamente cargado.
+    Procesa videos con YOLO completamente en memoria RAM.
 
-    Genera un archivo MP4 anotado y devuelve métricas de:
-    - detecciones;
-    - máscaras;
-    - confianza;
-    - FPS;
-    - duración;
-    - uso de memoria RAM.
+    Entrada:
+        bytes del video recibido por FastAPI.
+
+    Salida:
+        bytes del video MP4 segmentado y sus métricas.
+
+    No utiliza:
+        - rutas Path;
+        - archivos temporales;
+        - cv2.VideoCapture;
+        - cv2.VideoWriter;
+        - almacenamiento permanente.
     """
 
     MINIMUM_CLIP_SECONDS = 5.0
     MINIMUM_MAX_SIDE = 320
     DURATION_TOLERANCE_SECONDS = 0.20
+    DEFAULT_SOURCE_FPS = 25.0
+    OUTPUT_VIDEO_FORMAT = "mp4"
+    OUTPUT_CODEC = "libx264"
 
     def __init__(
         self,
@@ -50,9 +61,19 @@ class YOLOVideoProcessor:
         )
 
         self.segmenter = segmenter
-        self.clip_seconds = float(clip_seconds)
-        self.max_side = int(max_side)
-        self.max_output_fps = float(max_output_fps)
+        self.clip_seconds = float(
+            clip_seconds
+        )
+        self.max_side = int(
+            max_side
+        )
+        self.max_output_fps = float(
+            max_output_fps
+        )
+
+    # =====================================================
+    # VALIDACIONES
+    # =====================================================
 
     @classmethod
     def _validate_configuration(
@@ -66,21 +87,31 @@ class YOLOVideoProcessor:
         Valida los parámetros principales.
         """
 
-        if not isinstance(segmenter, YOLOSegmenter):
+        if not isinstance(
+            segmenter,
+            YOLOSegmenter,
+        ):
             raise TypeError(
                 "segmenter debe ser una instancia "
                 "de YOLOSegmenter."
             )
 
-        if not math.isfinite(clip_seconds):
+        if not math.isfinite(
+            clip_seconds
+        ):
             raise ValueError(
-                "clip_seconds debe ser un número válido."
+                "clip_seconds debe ser "
+                "un número válido."
             )
 
-        if clip_seconds < cls.MINIMUM_CLIP_SECONDS:
+        if (
+            clip_seconds
+            < cls.MINIMUM_CLIP_SECONDS
+        ):
             raise ValueError(
                 "El clip debe durar al menos "
-                f"{cls.MINIMUM_CLIP_SECONDS:.1f} segundos."
+                f"{cls.MINIMUM_CLIP_SECONDS:.1f} "
+                "segundos."
             )
 
         if max_side < cls.MINIMUM_MAX_SIDE:
@@ -90,12 +121,80 @@ class YOLOVideoProcessor:
             )
 
         if (
-            not math.isfinite(max_output_fps)
+            not math.isfinite(
+                max_output_fps
+            )
             or max_output_fps <= 0.0
         ):
             raise ValueError(
-                "max_output_fps debe ser mayor que cero."
+                "max_output_fps debe ser "
+                "mayor que cero."
             )
+
+    @staticmethod
+    def _validate_video_data(
+        video_data: bytes,
+    ) -> None:
+        """
+        Verifica que los bytes del video sean válidos.
+        """
+
+        if not isinstance(
+            video_data,
+            bytes,
+        ):
+            raise TypeError(
+                "El video debe recibirse como bytes."
+            )
+
+        if not video_data:
+            raise ValueError(
+                "El video recibido está vacío."
+            )
+
+    @staticmethod
+    def _validate_frame(
+        frame: NDArray[np.uint8] | None,
+        description: str,
+    ) -> None:
+        """
+        Verifica que un frame sea válido.
+        """
+
+        if frame is None:
+            raise RuntimeError(
+                f"{description} es None."
+            )
+
+        if not isinstance(
+            frame,
+            np.ndarray,
+        ):
+            raise TypeError(
+                f"{description} no es "
+                "una matriz NumPy."
+            )
+
+        if frame.size == 0:
+            raise RuntimeError(
+                f"{description} está vacío."
+            )
+
+        if frame.ndim != 3:
+            raise RuntimeError(
+                f"{description} debe tener "
+                "tres dimensiones."
+            )
+
+        if frame.shape[2] != 3:
+            raise RuntimeError(
+                f"{description} debe tener "
+                "tres canales BGR."
+            )
+
+    # =====================================================
+    # FUNCIONES AUXILIARES
+    # =====================================================
 
     @staticmethod
     def _calculate_output_size(
@@ -104,11 +203,11 @@ class YOLOVideoProcessor:
         max_side: int,
     ) -> tuple[int, int]:
         """
-        Calcula la resolución de salida manteniendo
+        Calcula la resolución de salida conservando
         la relación de aspecto.
 
-        Las dimensiones finales se ajustan a números pares
-        para mejorar la compatibilidad con codecs de video.
+        Las dimensiones se ajustan a números pares
+        para mejorar la compatibilidad con H.264.
         """
 
         if width <= 0 or height <= 0:
@@ -123,25 +222,46 @@ class YOLOVideoProcessor:
 
         scale = min(
             1.0,
-            max_side / float(largest_side),
+            max_side / float(
+                largest_side
+            ),
         )
 
         output_width = max(
             2,
-            int(round(width * scale)),
+            int(
+                round(
+                    width * scale
+                )
+            ),
         )
 
         output_height = max(
             2,
-            int(round(height * scale)),
+            int(
+                round(
+                    height * scale
+                )
+            ),
         )
 
-        output_width -= output_width % 2
-        output_height -= output_height % 2
+        output_width -= (
+            output_width % 2
+        )
+
+        output_height -= (
+            output_height % 2
+        )
 
         return (
-            max(2, output_width),
-            max(2, output_height),
+            max(
+                2,
+                output_width,
+            ),
+            max(
+                2,
+                output_height,
+            ),
         )
 
     @staticmethod
@@ -149,7 +269,7 @@ class YOLOVideoProcessor:
         process: psutil.Process,
     ) -> float:
         """
-        Devuelve la memoria RAM utilizada por el proceso.
+        Devuelve la RAM del proceso en MB.
         """
 
         return (
@@ -158,94 +278,209 @@ class YOLOVideoProcessor:
         )
 
     @staticmethod
-    def _extract_detections(
-        result: Any,
-    ) -> tuple[list[float], list[int], int, int]:
+    def _obtain_stream_fps(
+        stream: av.video.stream.VideoStream,
+    ) -> float:
         """
-        Extrae las confianzas, clases, cantidad de cajas
-        y cantidad de máscaras de un resultado YOLO.
+        Obtiene el FPS del flujo de video.
         """
 
-        confidences: list[float] = []
-        class_ids: list[int] = []
+        fps_candidates = [
+            stream.average_rate,
+            stream.base_rate,
+            stream.guessed_rate,
+        ]
 
-        detection_count = (
-            len(result.boxes)
-            if result.boxes is not None
-            else 0
+        for candidate in fps_candidates:
+            if candidate is None:
+                continue
+
+            try:
+                fps = float(
+                    candidate
+                )
+            except (
+                TypeError,
+                ValueError,
+                ZeroDivisionError,
+            ):
+                continue
+
+            if (
+                math.isfinite(fps)
+                and fps > 0.0
+            ):
+                return fps
+
+        return (
+            YOLOVideoProcessor
+            .DEFAULT_SOURCE_FPS
         )
 
-        if result.boxes is not None:
-            if result.boxes.conf is not None:
-                confidences = (
-                    result.boxes.conf
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(float)
-                    .tolist()
-                )
-
-            if result.boxes.cls is not None:
-                class_ids = (
-                    result.boxes.cls
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(int)
-                    .tolist()
-                )
-
-        mask_count = 0
+    @staticmethod
+    def _obtain_source_duration(
+        input_container: av.container.InputContainer,
+        stream: av.video.stream.VideoStream,
+        source_fps: float,
+    ) -> float:
+        """
+        Calcula la duración aproximada del video.
+        """
 
         if (
-            result.masks is not None
-            and result.masks.data is not None
+            stream.duration is not None
+            and stream.time_base is not None
         ):
-            mask_count = int(
-                result.masks.data.shape[0]
+            duration = float(
+                stream.duration
+                * stream.time_base
             )
+
+            if (
+                math.isfinite(duration)
+                and duration > 0.0
+            ):
+                return duration
+
+        if (
+            input_container.duration
+            is not None
+        ):
+            duration = (
+                float(
+                    input_container.duration
+                )
+                / av.time_base
+            )
+
+            if (
+                math.isfinite(duration)
+                and duration > 0.0
+            ):
+                return duration
+
+        if (
+            stream.frames is not None
+            and stream.frames > 0
+            and source_fps > 0.0
+        ):
+            return (
+                float(stream.frames)
+                / source_fps
+            )
+
+        return 0.0
+
+    @staticmethod
+    def _extract_result_data(
+        metrics: dict[str, Any],
+    ) -> tuple[
+        list[float],
+        int,
+        int,
+        Counter[str],
+    ]:
+        """
+        Extrae información de las métricas producidas
+        por YOLOSegmenter.process_frame().
+        """
+
+        confidence_average = float(
+            metrics.get(
+                "confidence_average",
+                0.0,
+            )
+        )
+
+        detection_count = int(
+            metrics.get(
+                "detections",
+                0,
+            )
+        )
+
+        mask_count = int(
+            metrics.get(
+                "masks",
+                0,
+            )
+        )
+
+        confidences: list[float] = []
+
+        if detection_count > 0:
+            confidences.extend(
+                [
+                    confidence_average
+                ]
+                * detection_count
+            )
+
+        class_counter: Counter[str] = (
+            Counter()
+        )
+
+        classes_summary = str(
+            metrics.get(
+                "classes_summary",
+                "",
+            )
+        )
+
+        if (
+            classes_summary
+            and classes_summary
+            not in {
+                "Ningún objeto detectado",
+                "Ninguna clase detectada",
+            }
+        ):
+            for class_item in (
+                classes_summary.split(",")
+            ):
+                class_item = (
+                    class_item.strip()
+                )
+
+                if not class_item:
+                    continue
+
+                try:
+                    class_name, quantity = (
+                        class_item.rsplit(
+                            ":",
+                            maxsplit=1,
+                        )
+                    )
+
+                    class_counter[
+                        class_name.strip()
+                    ] += int(
+                        quantity.strip()
+                    )
+
+                except (
+                    ValueError,
+                    TypeError,
+                ):
+                    class_counter[
+                        class_item
+                    ] += 1
 
         return (
             confidences,
-            class_ids,
             detection_count,
             mask_count,
+            class_counter,
         )
 
-    @staticmethod
-    def _get_class_name(
-        result: Any,
-        class_id: int,
-    ) -> str:
-        """
-        Convierte un identificador de clase
-        en un nombre legible.
-        """
-
-        names = result.names
-
-        if isinstance(names, dict):
-            return str(
-                names.get(
-                    class_id,
-                    f"clase_{class_id}",
-                )
-            )
-
-        if (
-            isinstance(names, (list, tuple))
-            and 0 <= class_id < len(names)
-        ):
-            return str(
-                names[class_id]
-            )
-
-        return f"clase_{class_id}"
+    # =====================================================
+    # PANEL DE MÉTRICAS
+    # =====================================================
 
     @staticmethod
     def _draw_overlay(
-        frame: Any,
+        frame: NDArray[np.uint8],
         processing_fps: float,
         ram_mb: float,
         detections: int,
@@ -259,14 +494,15 @@ class YOLOVideoProcessor:
         lines = [
             (
                 "YOLO-SEG | "
-                f"FPS PROCESO: {processing_fps:.2f}"
+                f"FPS PROCESO: "
+                f"{processing_fps:.2f}"
             ),
             (
                 f"RAM: {ram_mb:.1f} MB | "
                 f"OBJETOS: {detections}"
             ),
             (
-                f"CONF. PROM.: "
+                "CONF. PROM.: "
                 f"{average_confidence * 100:.1f}% | "
                 f"FRAME: {frame_number}"
             ),
@@ -277,7 +513,10 @@ class YOLOVideoProcessor:
             580,
         )
 
-        panel_height = 92
+        panel_height = min(
+            frame.shape[0],
+            92,
+        )
 
         cv2.rectangle(
             frame,
@@ -290,13 +529,22 @@ class YOLOVideoProcessor:
             thickness=-1,
         )
 
-        for index, line in enumerate(lines):
+        for index, line in enumerate(
+            lines
+        ):
+            y_position = (
+                28 + index * 27
+            )
+
+            if y_position >= frame.shape[0]:
+                break
+
             cv2.putText(
                 frame,
                 line,
                 (
                     12,
-                    28 + index * 27,
+                    y_position,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -305,147 +553,88 @@ class YOLOVideoProcessor:
                 cv2.LINE_AA,
             )
 
-    @staticmethod
-    def _validate_annotated_frame(
-        annotated_frame: Any,
-    ) -> None:
-        """
-        Comprueba que YOLO haya generado un frame válido.
-        """
-
-        if annotated_frame is None:
-            raise RuntimeError(
-                "YOLO no generó un frame anotado."
-            )
-
-        if annotated_frame.size == 0:
-            raise RuntimeError(
-                "YOLO generó un frame anotado vacío."
-            )
-
-        if len(annotated_frame.shape) != 3:
-            raise RuntimeError(
-                "El frame anotado tiene un formato inválido."
-            )
-
-    @staticmethod
-    def _create_video_writer(
-        output_path: Path,
-        output_fps: float,
-        output_width: int,
-        output_height: int,
-    ) -> cv2.VideoWriter:
-        """
-        Crea el escritor MP4 utilizando el codec mp4v.
-        """
-
-        codec = cv2.VideoWriter_fourcc(
-            *"mp4v"
-        )
-
-        writer = cv2.VideoWriter(
-            str(output_path),
-            codec,
-            output_fps,
-            (
-                output_width,
-                output_height,
-            ),
-        )
-
-        if not writer.isOpened():
-            writer.release()
-
-            raise RuntimeError(
-                "No se pudo crear el video MP4 "
-                "con el codec mp4v."
-            )
-
-        return writer
+    # =====================================================
+    # PROCESAMIENTO EN RAM
+    # =====================================================
 
     def process_video(
         self,
-        input_path: Path,
-        output_path: Path,
-    ) -> dict[str, Any]:
+        video_data: bytes,
+    ) -> tuple[
+        bytes,
+        dict[str, Any],
+    ]:
         """
-        Procesa el video de entrada, genera un MP4
-        segmentado y devuelve sus métricas.
+        Procesa un video completamente en RAM.
+
+        Parámetros:
+            video_data:
+                Video original como bytes.
+
+        Retorna:
+            video_segmentado_bytes, métricas
+
+        El método:
+            1. Lee el MP4 desde BytesIO.
+            2. Decodifica cada frame con PyAV.
+            3. Procesa cada frame con YOLO.
+            4. Codifica el resultado con H.264.
+            5. Devuelve el MP4 segmentado como bytes.
         """
 
-        input_path = Path(input_path)
-        output_path = Path(output_path)
-
-        if not input_path.is_file():
-            raise FileNotFoundError(
-                "No se encontró el video de entrada: "
-                f"{input_path}"
-            )
-
-        if input_path.stat().st_size == 0:
-            raise ValueError(
-                "El video de entrada está vacío: "
-                f"{input_path}"
-            )
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+        self._validate_video_data(
+            video_data
         )
 
-        output_path.unlink(
-            missing_ok=True
+        input_buffer = BytesIO(
+            video_data
         )
 
-        capture = cv2.VideoCapture(
-            str(input_path)
-        )
+        output_buffer = BytesIO()
 
-        if not capture.isOpened():
-            capture.release()
+        input_container: (
+            av.container.InputContainer
+            | None
+        ) = None
 
-            raise RuntimeError(
-                "OpenCV no pudo abrir el video. "
-                "El archivo puede estar dañado o "
-                "utilizar un codec no compatible."
-            )
-
-        writer: cv2.VideoWriter | None = None
-        processing_completed = False
+        output_container: (
+            av.container.OutputContainer
+            | None
+        ) = None
 
         try:
-            # =================================================
-            # INFORMACIÓN DEL VIDEO ORIGINAL
-            # =================================================
-
-            source_fps = float(
-                capture.get(
-                    cv2.CAP_PROP_FPS
-                )
+            input_container = av.open(
+                input_buffer,
+                mode="r",
             )
 
-            if (
-                not math.isfinite(source_fps)
-                or source_fps <= 0.0
-            ):
-                source_fps = 25.0
+            video_streams = [
+                stream
+                for stream
+                in input_container.streams
+                if stream.type == "video"
+            ]
+
+            if not video_streams:
+                raise ValueError(
+                    "El archivo recibido no contiene "
+                    "un flujo de video."
+                )
+
+            input_stream = (
+                video_streams[0]
+            )
 
             source_width = int(
-                capture.get(
-                    cv2.CAP_PROP_FRAME_WIDTH
-                )
+                input_stream.codec_context.width
+                or input_stream.width
+                or 0
             )
 
             source_height = int(
-                capture.get(
-                    cv2.CAP_PROP_FRAME_HEIGHT
-                )
-            )
-
-            source_total_frames = int(
-                capture.get(
-                    cv2.CAP_PROP_FRAME_COUNT
-                )
+                input_stream.codec_context.height
+                or input_stream.height
+                or 0
             )
 
             if (
@@ -453,14 +642,22 @@ class YOLOVideoProcessor:
                 or source_height <= 0
             ):
                 raise ValueError(
-                    "No se pudieron obtener las dimensiones "
-                    "del video de entrada."
+                    "No se pudieron determinar "
+                    "las dimensiones del video."
                 )
 
+            source_fps = (
+                self._obtain_stream_fps(
+                    input_stream
+                )
+            )
+
             source_duration = (
-                source_total_frames / source_fps
-                if source_total_frames > 0
-                else 0.0
+                self._obtain_source_duration(
+                    input_container,
+                    input_stream,
+                    source_fps,
+                )
             )
 
             if (
@@ -472,14 +669,11 @@ class YOLOVideoProcessor:
                 )
             ):
                 raise ValueError(
-                    f"El video dura {source_duration:.2f} s. "
+                    f"El video dura "
+                    f"{source_duration:.2f} s. "
                     f"Se requieren al menos "
                     f"{self.clip_seconds:.2f} s."
                 )
-
-            # =================================================
-            # RESOLUCIÓN Y FPS DE SALIDA
-            # =================================================
 
             (
                 output_width,
@@ -496,16 +690,26 @@ class YOLOVideoProcessor:
             )
 
             if (
-                not math.isfinite(output_fps)
+                not math.isfinite(
+                    output_fps
+                )
                 or output_fps <= 0.0
             ):
                 raise ValueError(
-                    "No se pudo calcular un FPS "
-                    "de salida válido."
+                    "No se pudo determinar "
+                    "un FPS de salida válido."
                 )
 
-            sample_step = (
-                source_fps / output_fps
+            output_rate = Fraction(
+                max(
+                    1,
+                    int(
+                        round(
+                            output_fps
+                        )
+                    ),
+                ),
+                1,
             )
 
             target_output_frames = max(
@@ -518,32 +722,62 @@ class YOLOVideoProcessor:
                 ),
             )
 
-            max_input_frames = max(
-                1,
-                int(
-                    math.ceil(
-                        self.clip_seconds
-                        * source_fps
-                    )
-                ),
+            sample_step = (
+                source_fps
+                / output_fps
             )
 
-            if source_total_frames > 0:
-                max_input_frames = min(
-                    max_input_frames,
-                    source_total_frames,
+            # =================================================
+            # CREAR CONTENEDOR MP4 EN MEMORIA
+            # =================================================
+
+            output_container = av.open(
+                output_buffer,
+                mode="w",
+                format=self.OUTPUT_VIDEO_FORMAT,
+                options={
+                    "movflags": (
+                        "frag_keyframe+"
+                        "empty_moov+"
+                        "default_base_moof"
+                    ),
+                },
+            )
+
+            try:
+                output_stream = (
+                    output_container.add_stream(
+                        self.OUTPUT_CODEC,
+                        rate=output_rate,
+                    )
                 )
 
-            # =================================================
-            # CREAR VIDEO DE SALIDA
-            # =================================================
+            except av.error.FFmpegError:
+                # Alternativa para sistemas donde
+                # libx264 no está disponible.
+                output_stream = (
+                    output_container.add_stream(
+                        "mpeg4",
+                        rate=output_rate,
+                    )
+                )
 
-            writer = self._create_video_writer(
-                output_path=output_path,
-                output_fps=output_fps,
-                output_width=output_width,
-                output_height=output_height,
+            output_stream.width = (
+                output_width
             )
+
+            output_stream.height = (
+                output_height
+            )
+
+            output_stream.pix_fmt = (
+                "yuv420p"
+            )
+
+            output_stream.options = {
+                "preset": "veryfast",
+                "crf": "23",
+            }
 
             # =================================================
             # VARIABLES DE MÉTRICAS
@@ -563,15 +797,17 @@ class YOLOVideoProcessor:
 
             all_confidences: list[float] = []
 
-            class_counter: Counter[str] = Counter()
+            class_counter: Counter[str] = (
+                Counter()
+            )
 
             total_detections = 0
             total_masks = 0
             frames_with_detections = 0
             inference_ms_total = 0.0
 
-            read_frames = 0
-            processed_frames = 0
+            frames_read = 0
+            frames_processed = 0
             next_sample_index = 0.0
 
             processing_start = (
@@ -579,21 +815,25 @@ class YOLOVideoProcessor:
             )
 
             # =================================================
-            # PROCESAMIENTO CUADRO POR CUADRO
+            # DECODIFICAR Y PROCESAR FRAMES
             # =================================================
 
-            while (
-                read_frames < max_input_frames
-                and processed_frames
-                < target_output_frames
+            for decoded_frame in (
+                input_container.decode(
+                    input_stream
+                )
             ):
-                ok, frame = capture.read()
-
-                if not ok or frame is None:
+                if (
+                    frames_processed
+                    >= target_output_frames
+                ):
                     break
 
-                current_index = read_frames
-                read_frames += 1
+                current_index = (
+                    frames_read
+                )
+
+                frames_read += 1
 
                 if (
                     current_index + 1e-9
@@ -601,16 +841,26 @@ class YOLOVideoProcessor:
                 ):
                     continue
 
-                next_sample_index += sample_step
+                next_sample_index += (
+                    sample_step
+                )
 
-                if frame.size == 0:
-                    raise RuntimeError(
-                        "OpenCV devolvió un frame vacío."
+                frame = (
+                    decoded_frame.to_ndarray(
+                        format="bgr24"
                     )
+                )
+
+                self._validate_frame(
+                    frame,
+                    "El frame decodificado",
+                )
 
                 if (
-                    frame.shape[1] != output_width
-                    or frame.shape[0] != output_height
+                    frame.shape[1]
+                    != output_width
+                    or frame.shape[0]
+                    != output_height
                 ):
                     frame = cv2.resize(
                         frame,
@@ -618,37 +868,25 @@ class YOLOVideoProcessor:
                             output_width,
                             output_height,
                         ),
-                        interpolation=cv2.INTER_AREA,
+                        interpolation=(
+                            cv2.INTER_AREA
+                        ),
                     )
 
                 # =============================================
-                # INFERENCIA YOLO
+                # YOLO COMPLETAMENTE EN RAM
                 # =============================================
 
-                results = self.segmenter.model.predict(
-                    source=frame,
-                    conf=self.segmenter.confidence,
-                    device=self.segmenter.device,
-                    imgsz=self.segmenter.image_size,
-                    retina_masks=True,
-                    classes=(
-                        self.segmenter.target_class_ids
-                    ),
-                    verbose=False,
+                (
+                    annotated_frame,
+                    frame_metrics,
+                ) = self.segmenter.process_frame(
+                    frame
                 )
 
-                if not results:
-                    raise RuntimeError(
-                        "YOLO no devolvió resultados "
-                        "para un frame del video."
-                    )
-
-                result = results[0]
-
-                annotated_frame = result.plot()
-
-                self._validate_annotated_frame(
-                    annotated_frame
+                self._validate_frame(
+                    annotated_frame,
+                    "El frame segmentado",
                 )
 
                 if (
@@ -663,56 +901,59 @@ class YOLOVideoProcessor:
                             output_width,
                             output_height,
                         ),
-                        interpolation=cv2.INTER_AREA,
+                        interpolation=(
+                            cv2.INTER_AREA
+                        ),
                     )
 
                 (
                     confidences,
-                    class_ids,
                     frame_detection_count,
-                    mask_count,
-                ) = self._extract_detections(
-                    result
+                    frame_mask_count,
+                    frame_class_counter,
+                ) = self._extract_result_data(
+                    frame_metrics
                 )
 
                 frame_average_confidence = (
-                    sum(confidences)
-                    / len(confidences)
-                    if confidences
-                    else 0.0
+                    float(
+                        frame_metrics.get(
+                            "confidence_average",
+                            0.0,
+                        )
+                    )
                 )
 
-                if frame_detection_count > 0:
+                if (
+                    frame_detection_count
+                    > 0
+                ):
                     frames_with_detections += 1
 
                 total_detections += (
                     frame_detection_count
                 )
 
-                total_masks += mask_count
+                total_masks += (
+                    frame_mask_count
+                )
 
                 all_confidences.extend(
                     confidences
                 )
 
-                for class_id in class_ids:
-                    class_name = (
-                        self._get_class_name(
-                            result,
-                            class_id,
-                        )
-                    )
-
-                    class_counter[class_name] += 1
+                class_counter.update(
+                    frame_class_counter
+                )
 
                 inference_ms_total += float(
-                    result.speed.get(
-                        "inference",
+                    frame_metrics.get(
+                        "inference_ms",
                         0.0,
                     )
                 )
 
-                processed_frames += 1
+                frames_processed += 1
 
                 elapsed_seconds = (
                     time.perf_counter()
@@ -720,7 +961,7 @@ class YOLOVideoProcessor:
                 )
 
                 current_processing_fps = (
-                    processed_frames
+                    frames_processed
                     / elapsed_seconds
                     if elapsed_seconds > 0.0
                     else 0.0
@@ -737,10 +978,6 @@ class YOLOVideoProcessor:
                     ram_current_mb,
                 )
 
-                # =============================================
-                # MÉTRICAS VISIBLES EN EL VIDEO
-                # =============================================
-
                 self._draw_overlay(
                     frame=annotated_frame,
                     processing_fps=(
@@ -753,17 +990,49 @@ class YOLOVideoProcessor:
                     average_confidence=(
                         frame_average_confidence
                     ),
-                    frame_number=processed_frames,
+                    frame_number=(
+                        frames_processed
+                    ),
                 )
 
-                writer.write(
-                    annotated_frame
+                # =============================================
+                # CODIFICAR FRAME EN MEMORIA
+                # =============================================
+
+                output_frame = (
+                    av.VideoFrame.from_ndarray(
+                        annotated_frame,
+                        format="bgr24",
+                    )
                 )
 
-                if processed_frames % 10 == 0:
+                output_frame.pts = (
+                    frames_processed - 1
+                )
+
+                output_frame.time_base = (
+                    Fraction(
+                        1,
+                        output_rate.numerator,
+                    )
+                )
+
+                for packet in (
+                    output_stream.encode(
+                        output_frame
+                    )
+                ):
+                    output_container.mux(
+                        packet
+                    )
+
+                if (
+                    frames_processed
+                    % 10 == 0
+                ):
                     print(
                         "\rFrames segmentados: "
-                        f"{processed_frames}/"
+                        f"{frames_processed}/"
                         f"{target_output_frames} | "
                         "FPS proceso: "
                         f"{current_processing_fps:.2f}",
@@ -771,21 +1040,33 @@ class YOLOVideoProcessor:
                         flush=True,
                     )
 
-            processing_seconds = (
-                time.perf_counter()
-                - processing_start
-            )
-
             print()
 
-            if processed_frames == 0:
+            if frames_processed == 0:
                 raise RuntimeError(
                     "No se pudo procesar ningún "
                     "frame del video."
                 )
 
+            # Vaciar los frames pendientes del codec.
+            for packet in (
+                output_stream.encode()
+            ):
+                output_container.mux(
+                    packet
+                )
+
+            output_container.close()
+            output_container = None
+
+            processing_seconds = (
+                time.perf_counter()
+                - processing_start
+            )
+
             output_duration = (
-                processed_frames / output_fps
+                frames_processed
+                / output_fps
             )
 
             if (
@@ -795,42 +1076,41 @@ class YOLOVideoProcessor:
             ):
                 raise ValueError(
                     "Solo se pudieron generar "
-                    f"{output_duration:.2f} s de video. "
-                    f"Se requieren "
+                    f"{output_duration:.2f} s "
+                    "de video. Se requieren "
                     f"{self.clip_seconds:.2f} s."
                 )
 
-            writer.release()
-            writer = None
+            output_video_data = (
+                output_buffer.getvalue()
+            )
 
-            if (
-                not output_path.is_file()
-                or output_path.stat().st_size == 0
-            ):
+            if not output_video_data:
                 raise RuntimeError(
-                    "El video segmentado no fue "
-                    "creado correctamente."
+                    "El video segmentado generado "
+                    "en RAM está vacío."
                 )
 
             # =================================================
-            # MÉTRICAS GENERALES
+            # MÉTRICAS FINALES
             # =================================================
 
             average_inference_ms = (
                 inference_ms_total
-                / processed_frames
-                if processed_frames > 0
+                / frames_processed
+                if frames_processed > 0
                 else 0.0
             )
 
             inference_fps = (
-                1000.0 / average_inference_ms
+                1000.0
+                / average_inference_ms
                 if average_inference_ms > 0.0
                 else 0.0
             )
 
             processing_fps = (
-                processed_frames
+                frames_processed
                 / processing_seconds
                 if processing_seconds > 0.0
                 else 0.0
@@ -850,7 +1130,9 @@ class YOLOVideoProcessor:
             )
 
             classes_summary = ", ".join(
-                f"{name}: {quantity}"
+                (
+                    f"{name}: {quantity}"
+                )
                 for name, quantity
                 in class_counter.most_common()
             )
@@ -866,22 +1148,36 @@ class YOLOVideoProcessor:
                 )
             )
 
+            source_total_frames = int(
+                input_stream.frames or 0
+            )
+
             metrics: dict[str, Any] = {
-                "input_path": str(input_path),
-                "output_path": str(output_path),
-                "model": self.segmenter.model_name,
+                "storage_mode": "memory",
+                "input_path": None,
+                "output_path": None,
+                "model": (
+                    self.segmenter.model_name
+                ),
                 "device": str(
                     self.segmenter.device
                 ),
                 "target_class": (
                     self.segmenter.target_class_name
-                    if self.segmenter.filter_only_target
+                    if (
+                        self.segmenter
+                        .filter_only_target
+                    )
                     else None
                 ),
                 "source_fps": source_fps,
                 "output_fps": output_fps,
-                "source_width": source_width,
-                "source_height": source_height,
+                "source_width": (
+                    source_width
+                ),
+                "source_height": (
+                    source_height
+                ),
                 "source_total_frames": (
                     source_total_frames
                 ),
@@ -894,9 +1190,11 @@ class YOLOVideoProcessor:
                 "target_output_frames": (
                     target_output_frames
                 ),
-                "frames_read": read_frames,
+                "frames_read": (
+                    frames_read
+                ),
                 "frames_processed": (
-                    processed_frames
+                    frames_processed
                 ),
                 "frames_with_detections": (
                     frames_with_detections
@@ -916,57 +1214,89 @@ class YOLOVideoProcessor:
                 "processing_fps": (
                     processing_fps
                 ),
-                "inference_fps": inference_fps,
+                "inference_fps": (
+                    inference_fps
+                ),
                 "average_inference_ms": (
                     average_inference_ms
                 ),
                 "processing_seconds": (
                     processing_seconds
                 ),
-                "ram_before_mb": ram_before_mb,
-                "ram_after_mb": ram_after_mb,
-                "ram_difference_mb": (
-                    ram_after_mb - ram_before_mb
+                "ram_before_mb": (
+                    ram_before_mb
                 ),
-                "ram_peak_mb": ram_peak_mb,
+                "ram_after_mb": (
+                    ram_after_mb
+                ),
+                "ram_difference_mb": (
+                    ram_after_mb
+                    - ram_before_mb
+                ),
+                "ram_peak_mb": (
+                    ram_peak_mb
+                ),
                 "system_ram_percent": float(
-                    psutil.virtual_memory().percent
+                    psutil.virtual_memory()
+                    .percent
                 ),
                 "classes_summary": (
                     classes_summary
                 ),
-                "output_width": output_width,
-                "output_height": output_height,
-                "output_size_mb": (
-                    output_path.stat().st_size
+                "output_width": (
+                    output_width
+                ),
+                "output_height": (
+                    output_height
+                ),
+                "input_size_bytes": (
+                    len(video_data)
+                ),
+                "output_size_bytes": (
+                    len(output_video_data)
+                ),
+                "input_size_mb": (
+                    len(video_data)
                     / (1024 * 1024)
                 ),
+                "output_size_mb": (
+                    len(output_video_data)
+                    / (1024 * 1024)
+                ),
+                "output_format": "mp4",
+                "output_codec": (
+                    output_stream.codec_context.name
+                ),
             }
-
-            processing_completed = True
 
             self.print_metrics(
                 metrics
             )
 
-            return metrics
-
-        except Exception:
-            output_path.unlink(
-                missing_ok=True
+            return (
+                output_video_data,
+                metrics,
             )
-            raise
+
+        except av.error.FFmpegError as error:
+            raise RuntimeError(
+                "PyAV no pudo decodificar o codificar "
+                f"el video: {error}"
+            ) from error
 
         finally:
-            capture.release()
+            if input_container is not None:
+                input_container.close()
 
-            if writer is not None:
-                writer.release()
+            if output_container is not None:
+                output_container.close()
 
-            if not processing_completed:
-                output_path.unlink(
-                    missing_ok=True
-                )
+            input_buffer.close()
+            output_buffer.close()
+
+    # =====================================================
+    # MOSTRAR MÉTRICAS
+    # =====================================================
 
     @staticmethod
     def print_metrics(
@@ -991,6 +1321,10 @@ class YOLOVideoProcessor:
         print(
             f"Clase objetivo            : "
             f"{metrics['target_class'] or 'Todas'}"
+        )
+        print(
+            f"Modo de almacenamiento    : "
+            f"{metrics['storage_mode']}"
         )
         print(
             f"Resolución original       : "
@@ -1075,17 +1409,24 @@ class YOLOVideoProcessor:
             f"{metrics['system_ram_percent']:.2f} %"
         )
         print(
-            f"Tamaño del MP4            : "
+            f"Tamaño del video original : "
+            f"{metrics['input_size_mb']:.2f} MB"
+        )
+        print(
+            f"Tamaño del video generado : "
             f"{metrics['output_size_mb']:.2f} MB"
+        )
+        print(
+            f"Codec de salida           : "
+            f"{metrics['output_codec']}"
         )
         print(
             f"Clases detectadas         : "
             f"{metrics['classes_summary']}"
         )
         print(
-            f"Resultado                 : "
-            f"{metrics['output_path']}"
+            "Resultado                 : "
+            "conservado en memoria RAM"
         )
         print("=" * 68)
         print()
-

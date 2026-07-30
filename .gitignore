@@ -1,0 +1,52 @@
+# Compilación
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editores
+.vscode/
+.idea/
+
+# Credenciales privadas
+.env
+.env.*
+*.env
+TelegramBot/config.py
+credentials.json
+secrets.json
+*.pem
+*.key
+
+# Dataset pesado
+dataset/*
+!dataset/README.md
+!dataset/.gitkeep
+
+# Archivos generados durante la ejecución
+captures/*
+videos/*
+!captures/.gitkeep
+!videos/.gitkeep
+
+# Temporales
+*.log
+*.tmp
+*~

@@ -1,0 +1,33 @@
+MODELO HOG + SVM PARA TAXIS AMARILLOS
+=====================================
+
+Ventana HOG: 128 x 64
+Longitud descriptor: 3780
+Muestras train: 7496
+Tiempo entrenamiento: 10.9457 segundos
+SVM: C_SVC lineal
+C: 0.01
+Semilla: 42
+
+VALIDATION
+Accuracy: 99.2063 %
+Precisión: 99.1453 %
+Sensibilidad: 99.1453 %
+Especificidad: 99.2593 %
+F1-score: 99.1453 %
+VP: 116
+VN: 134
+FP: 1
+FN: 1
+
+TEST
+Accuracy: 99.2063 %
+Precisión: 99.1453 %
+Sensibilidad: 99.1453 %
+Especificidad: 99.2593 %
+F1-score: 99.1453 %
+VP: 116
+VN: 134
+FP: 1
+FN: 1
+

@@ -1,0 +1,3 @@
+conjunto,accuracy,precision,sensibilidad,especificidad,f1,vp,vn,fp,fn,tiempo_prediccion_ms,tiempo_entrenamiento_segundos,muestras_train,longitud_descriptor
+validation,0.99206349,0.99145299,0.99145299,0.99259259,0.99145299,116,134,1,1,0.00185393,10.94570508,7496,3780
+test,0.99206349,0.99145299,0.99145299,0.99259259,0.99145299,116,134,1,1,0.00144792,10.94570508,7496,3780

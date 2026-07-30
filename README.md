@@ -121,6 +121,10 @@ ProyectoTaxiDetector/
 │       ├── validation/
 │       └── test/
 ├── include/
+│   ├── detector_hog.hpp
+│   ├── capturador.hpp
+│   ├── cliente_api.hpp
+│   └── grabador_video.cpp
 ├── models/
 │   └── hog_svm_taxi.yml
 ├── resultados/
@@ -132,7 +136,13 @@ ProyectoTaxiDetector/
 │   └── preparar_dataset_hog.py
 ├── src/
 │   ├── detector_hog.cpp
-│   ├── detectar_taxi_imagen_v2.cpp
+│   ├── capturador.cpp
+│   ├── cliente_api.cpp
+│   ├── grabador_video.cpp
+│   ├── detector_hog.cpp
+│   ├── entrenar_hog_svm.cpp.cpp
+│   ├── etiquetar_taxis.cpp
+│   ├── detectar_taxi_imagen.cpp
 │   └── detectar_taxi_camara.cpp
 ├── TelegramBot/
 │   ├── input/
